@@ -116,3 +116,15 @@ def fresh_db(outbox):
     finally:
         app_module.limiter.enabled = True
         reseed()  # leave the seeded data for the read-only tests
+
+
+@pytest.fixture
+def no_rate_limits(outbox):
+    """Turn off rate limits (and fake email) for a test that doesn't write."""
+    import app as app_module
+
+    app_module.limiter.enabled = False
+    try:
+        yield outbox
+    finally:
+        app_module.limiter.enabled = True

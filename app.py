@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Request, Form, Depends, Body, File, 
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 import os, logging, smtplib, secrets, string, pyodbc, time, ssl, datetime, base64, requests, threading
+from auth.dependencies import CurrentUser, require_admin, require_login, require_member, require_role
 from config import settings
 from db import SessionLocal, engine, get_db
 from models import (
@@ -693,9 +694,7 @@ async def logout_user(request: Request):
 
 # Endpoint to move a user from new_users to registered_users and delete item in new_users
 @app.post("/validation/validate_user/{user_email}")
-async def move_user(user_email: str, role: str = Depends(get_current_role), request: Request = None, db: Session = Depends(get_db)):
-    if role not in ('admin', 'teacher'):
-        raise HTTPException(status_code=403, detail="Access denied.")
+async def move_user(user_email: str, caller: CurrentUser = Depends(require_member), db: Session = Depends(get_db)):
     try:
         query = select(NewUsers).where(cast(NewUsers.email, String) == cast(user_email, String))
         result = db.execute(query)
@@ -704,9 +703,8 @@ async def move_user(user_email: str, role: str = Depends(get_current_role), requ
             raise HTTPException(status_code=404, detail="User not found in new_users")
 
         # Teachers can only validate users within their own district
-        if role == 'teacher':
-            id = get_current_id(request)
-            teacher_record = db.execute(select(TeacherList).where(TeacherList.regUserID == id)).fetchone()
+        if caller.role == 'teacher':
+            teacher_record = db.execute(select(TeacherList).where(TeacherList.regUserID == caller.id)).fetchone()
             if not teacher_record or (
                 user[0].state != teacher_record[0].state or
                 user[0].county != teacher_record[0].county or
@@ -730,42 +728,40 @@ async def move_user(user_email: str, role: str = Depends(get_current_role), requ
 
 ##this api allows a logged in user to create an item in the table teacher_list in the hithero database if they have not created a user already
 @app.post("/profile/create_teacher_profile/")
-async def create_teacher_profile(request: Request, name: str = Form(...), state: str = Form(...), county: str = Form(...), district: str = Form(...), school: str = Form(...), aboutMe: str = Form(...), wishlist: str = Form(...), id: int = Depends(get_current_id), role: str = Depends(get_current_role), db: Session = Depends(get_db)):
+async def create_teacher_profile(request: Request, name: str = Form(...), state: str = Form(...), county: str = Form(...), district: str = Form(...), school: str = Form(...), aboutMe: str = Form(...), wishlist: str = Form(...), user: CurrentUser = Depends(require_member), db: Session = Depends(get_db)):
+    id, role = user.id, user.role
     try:
-        if role:
-            query = select(RegisteredUsers.createCount).where(RegisteredUsers.id == id)
-            result = db.execute(query)
-            create_count = result.scalar()
-            if create_count == 0 or role == 'admin':
-                aa_link = wishlist + "&tag=h0mer00mher0-20" 
-                email = get_current_email(request)
-                first_part_email = email.split('@')[0]
+        query = select(RegisteredUsers.createCount).where(RegisteredUsers.id == id)
+        result = db.execute(query)
+        create_count = result.scalar()
+        if create_count == 0 or role == 'admin':
+            aa_link = wishlist + "&tag=h0mer00mher0-20" 
+            email = get_current_email(request)
+            first_part_email = email.split('@')[0]
+            random_number = secrets.randbelow(9999)
+            auto_url_id = f"{first_part_email}{random_number}"
+            while db.execute(select(TeacherList).where(cast(TeacherList.url_id, String) == cast(auto_url_id, String))).first():
                 random_number = secrets.randbelow(9999)
                 auto_url_id = f"{first_part_email}{random_number}"
-                while db.execute(select(TeacherList).where(cast(TeacherList.url_id, String) == cast(auto_url_id, String))).first():
-                    random_number = secrets.randbelow(9999)
-                    auto_url_id = f"{first_part_email}{random_number}"
 
-                insert_query = insert(TeacherList).values(
-                    name=name,
-                    state=state,
-                    county=county,
-                    district=district,
-                    school=school,
-                    regUserID=id,
-                    about_me=aboutMe,
-                    wishlist_url=aa_link,
-                    url_id=auto_url_id
-                )
-                db.execute(insert_query)
-                update_query = update(RegisteredUsers).where(RegisteredUsers.id == id).values(createCount=RegisteredUsers.createCount + 1)
-                db.execute(update_query)
-                db.commit()
-                return {"message": "Teacher created successfully", "role": role}
-            else:
-                return {"message": "Unable to create new profile. Profile already created."}
+            insert_query = insert(TeacherList).values(
+                name=name,
+                state=state,
+                county=county,
+                district=district,
+                school=school,
+                regUserID=id,
+                about_me=aboutMe,
+                wishlist_url=aa_link,
+                url_id=auto_url_id
+            )
+            db.execute(insert_query)
+            update_query = update(RegisteredUsers).where(RegisteredUsers.id == id).values(createCount=RegisteredUsers.createCount + 1)
+            db.execute(update_query)
+            db.commit()
+            return {"message": "Teacher created successfully", "role": role}
         else:
-            return {"message": "No user logged in."}
+            return {"message": "Unable to create new profile. Profile already created."}
     except Exception as e:
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")
@@ -916,15 +912,13 @@ async def get_teacher_info(request: Request, db: Session = Depends(get_db)):
 
 ##api that updates about me info
 @app.post("/profile/update_info/")
-async def update_info(request: Request, aboutMe: str = Form(...), id: int = Depends(get_current_id), role: str = Depends(get_current_role), db: Session = Depends(get_db)):
+async def update_info(request: Request, aboutMe: str = Form(...), user: CurrentUser = Depends(require_member), db: Session = Depends(get_db)):
+    id = user.id
     try:
-        if role:
-            update_query = update(TeacherList).where(TeacherList.regUserID == id).values(about_me=aboutMe)
-            db.execute(update_query)
-            db.commit()
-            return {"message": "Info updated."}
-        else:
-            raise HTTPException(status_code=403, detail="Permission denied.")
+        update_query = update(TeacherList).where(TeacherList.regUserID == id).values(about_me=aboutMe)
+        db.execute(update_query)
+        db.commit()
+        return {"message": "Info updated."}
     except Exception as e:
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")
@@ -937,22 +931,19 @@ async def update_teacher_school(
     county: str = Form(...),
     district: str = Form(...),
     school: str = Form(...),
-    id: int = Depends(get_current_id),
-    role: str = Depends(get_current_role), db: Session = Depends(get_db)
+    user: CurrentUser = Depends(require_member), db: Session = Depends(get_db)
 ):
+    id = user.id
     try:
-        if role:
-            update_query = update(TeacherList).where(TeacherList.regUserID == id).values(
-                state=state,
-                county=county,
-                district=district,
-                school=school
-            )
-            db.execute(update_query)
-            db.commit()
-            return JSONResponse(content={"message": "School information updated successfully."})
-        else:
-            raise HTTPException(status_code=403, detail="Permission denied. Not logged in.")
+        update_query = update(TeacherList).where(TeacherList.regUserID == id).values(
+            state=state,
+            county=county,
+            district=district,
+            school=school
+        )
+        db.execute(update_query)
+        db.commit()
+        return JSONResponse(content={"message": "School information updated successfully."})
     except Exception as e:
         db.rollback()
         logger.error(f"Internal Server Error: {str(e)}") 
@@ -960,15 +951,13 @@ async def update_teacher_school(
 
 ##api that updates name
 @app.post("/profile/update_teacher_name/")
-async def update_teacher_name(request: Request, teacher: str = Form(...), id: int = Depends(get_current_id), role: str = Depends(get_current_role), db: Session = Depends(get_db)):
+async def update_teacher_name(request: Request, teacher: str = Form(...), user: CurrentUser = Depends(require_member), db: Session = Depends(get_db)):
+    id = user.id
     try:
-        if role:
-            update_query = update(TeacherList).where(TeacherList.regUserID == id).values(name=teacher)
-            db.execute(update_query)
-            db.commit()
-            return {"message": "Name updated."}
-        else:
-            raise HTTPException(status_code=403, detail="Permission denied.")
+        update_query = update(TeacherList).where(TeacherList.regUserID == id).values(name=teacher)
+        db.execute(update_query)
+        db.commit()
+        return {"message": "Name updated."}
     except Exception as e:
         db.rollback()
         logger.error(f"Internal Server Error: {str(e)}") 
@@ -976,16 +965,14 @@ async def update_teacher_name(request: Request, teacher: str = Form(...), id: in
 
 ##api to update wishlist
 @app.post("/profile/update_wishlist/")
-async def update_wishlist(request: Request, wishlist: str = Form(...), id: int = Depends(get_current_id), role: str = Depends(get_current_role), db: Session = Depends(get_db)):
+async def update_wishlist(request: Request, wishlist: str = Form(...), user: CurrentUser = Depends(require_member), db: Session = Depends(get_db)):
+    id = user.id
     try:
-        if role:
-            aa_link = wishlist + "&tag=h0mer00mher0-20"
-            update_query = update(TeacherList).where(TeacherList.regUserID == id).values(wishlist_url=aa_link)
-            db.execute(update_query)
-            db.commit()
-            return {"message": "Wishlist updated."}
-        else:
-            raise HTTPException(status_code=403, detail="Permission denied.")
+        aa_link = wishlist + "&tag=h0mer00mher0-20"
+        update_query = update(TeacherList).where(TeacherList.regUserID == id).values(wishlist_url=aa_link)
+        db.execute(update_query)
+        db.commit()
+        return {"message": "Wishlist updated."}
     except Exception as e:
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")
@@ -993,20 +980,18 @@ async def update_wishlist(request: Request, wishlist: str = Form(...), id: int =
 
 #api that update the url of a teachers page
 @app.post("/profile/update_url_id/")
-async def update_url_id(request: Request, url_id: str = Form(...), id: int = Depends(get_current_id), role: str = Depends(get_current_role), db: Session = Depends(get_db)):
+async def update_url_id(request: Request, url_id: str = Form(...), user: CurrentUser = Depends(require_member), db: Session = Depends(get_db)):
+    id = user.id
     try:
-        if role:
-            if not re.match(r'^[a-zA-Z0-9_-]{3,50}$', url_id):
-                raise HTTPException(status_code=400, detail="URL ID may only contain letters, numbers, hyphens, and underscores (3–50 characters).")
-            existing_teacher = db.query(TeacherList).where(cast(TeacherList.url_id, String) == cast(url_id, String)).first()
-            if existing_teacher:
-                raise HTTPException(status_code=409, detail="URL ID already in use.")
-            update_query = update(TeacherList).where(TeacherList.regUserID == id).values(url_id=url_id)
-            db.execute(update_query)
-            db.commit()
-            return {"message": "URL ID updated successfully."}
-        else:
-            raise HTTPException(status_code=403, detail="Permission denied.")
+        if not re.match(r'^[a-zA-Z0-9_-]{3,50}$', url_id):
+            raise HTTPException(status_code=400, detail="URL ID may only contain letters, numbers, hyphens, and underscores (3–50 characters).")
+        existing_teacher = db.query(TeacherList).where(cast(TeacherList.url_id, String) == cast(url_id, String)).first()
+        if existing_teacher:
+            raise HTTPException(status_code=409, detail="URL ID already in use.")
+        update_query = update(TeacherList).where(TeacherList.regUserID == id).values(url_id=url_id)
+        db.execute(update_query)
+        db.commit()
+        return {"message": "URL ID updated successfully."}
     except HTTPException as e:
         raise e
     except Exception as e:
@@ -1016,7 +1001,8 @@ async def update_url_id(request: Request, url_id: str = Form(...), id: int = Dep
     
 ###api used to update the logged in users teacher page image
 @app.post("/profile/update_teacher_image/")
-async def edit_teacher_image(request: Request, role: str = Depends(get_current_role), image: UploadFile = Form(...), id: int = Depends(get_current_id), db: Session = Depends(get_db)):
+async def edit_teacher_image(request: Request, image: UploadFile = Form(...), user: CurrentUser = Depends(require_member), db: Session = Depends(get_db)):
+    id = user.id
     try:
         if image.size > MAX_FILE_SIZE:
             raise HTTPException(status_code=400, detail="File size exceeds the allowed limit")
@@ -1036,15 +1022,12 @@ async def edit_teacher_image(request: Request, role: str = Depends(get_current_r
         if detected_type not in ALLOWED_MIME_TYPES:
             raise HTTPException(status_code=400, detail="Invalid file type. Only JPEG, PNG, GIF, and WebP are allowed.")
         
-        if role:
-            update_query = update(TeacherList).values(image_data=image_bytes).where(
-                TeacherList.regUserID == id
-            )
-            db.execute(update_query)
-            db.commit()
-            return {"message": "Information updated."}
-        else:
-            return {"message": "Permission denied."}
+        update_query = update(TeacherList).values(image_data=image_bytes).where(
+            TeacherList.regUserID == id
+        )
+        db.execute(update_query)
+        db.commit()
+        return {"message": "Information updated."}
     except HTTPException as he:
         raise he
     except Exception as e:
@@ -1103,26 +1086,27 @@ async def update_password(request: Request, id: int = Depends(get_current_id), o
 
 #api to check if a user has edit acces to teacher page
 @app.get("/api/check_access_teacher/")
-async def check_access_teacher(request: Request, id: int = Depends(get_current_id), role: str = Depends(get_current_role), db: Session = Depends(get_db)):
+async def check_access_teacher(request: Request, user: CurrentUser = Depends(require_role("teacher")), db: Session = Depends(get_db)):
     try:
-        if role == 'teacher':
-            state = get_index_cookie('state', request)
-            county = get_index_cookie('county', request)
-            district = get_index_cookie('district', request)
-            school = get_index_cookie('school', request)
-            name = get_index_cookie('teacher', request)
-            query = select(TeacherList.regUserID).where(
-                (cast(TeacherList.state, String) == state) &
-                (cast(TeacherList.county, String) == county) &
-                (cast(TeacherList.district, String) == district) &
-                (cast(TeacherList.school, String) == school) &
-                (cast(TeacherList.name, String) == name)
-            )
-            result = db.execute(query)
-            teacher_data = result.scalar()
-            if teacher_data == id:
-                return {"status": "success", "message": "Access granted"}
+        state = get_index_cookie('state', request)
+        county = get_index_cookie('county', request)
+        district = get_index_cookie('district', request)
+        school = get_index_cookie('school', request)
+        name = get_index_cookie('teacher', request)
+        query = select(TeacherList.regUserID).where(
+            (cast(TeacherList.state, String) == state) &
+            (cast(TeacherList.county, String) == county) &
+            (cast(TeacherList.district, String) == district) &
+            (cast(TeacherList.school, String) == school) &
+            (cast(TeacherList.name, String) == name)
+        )
+        result = db.execute(query)
+        teacher_data = result.scalar()
+        if teacher_data == user.id:
+            return {"status": "success", "message": "Access granted"}
         raise HTTPException(status_code=403, detail="No access")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")
@@ -1130,7 +1114,8 @@ async def check_access_teacher(request: Request, id: int = Depends(get_current_i
 
 #gets a list of unverified users to validate based on the role of the user
 @app.get("/api/validation_list/")
-async def validation_page(request: Request, role: str = Depends(get_current_role), id: int = Depends(get_current_id), db: Session = Depends(get_db)):
+async def validation_page(request: Request, caller: CurrentUser = Depends(require_member), db: Session = Depends(get_db)):
+    role, id = caller.role, caller.id
     try:
         if role == "admin":
             query = select(NewUsers)
@@ -1150,8 +1135,6 @@ async def validation_page(request: Request, role: str = Depends(get_current_role
             result = db.execute(query)
             new_users = result.fetchall()
             return {"new_users": [{"name": user[0].name, "email": user[0].email, "state": user[0].state, "district": user[0].district, "school": user[0].school, "phone_number": user[0].phone_number, "report": user[0].report, "emailed": user[0].emailed} for user in new_users], "role": role}
-        else:
-            raise HTTPException(status_code=403, detail="You don't have permission to access this page.")
     except Exception as e:
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")          
@@ -1355,30 +1338,25 @@ async def get_teacher_info(url_id: str, request: Request, db: Session = Depends(
 
 # Endpoint to  users
 @app.post("/validation/delete_user/{user_email}")
-async def delete_user(user_email: str, role: str = Depends(get_current_role), db: Session = Depends(get_db)):
-    if role == 'admin':
-        try:
-            query = select(NewUsers).where(cast(NewUsers.email, String) == cast(user_email, String))
-            result = db.execute(query)
-            user = result.fetchone()
-            if not user:
-                raise HTTPException(status_code=404, detail="User not found in new_users")
-            delete_query = delete(NewUsers).where(cast(NewUsers.email, String) == cast(user_email, String))
-            db.execute(delete_query)
-            db.commit()
-            return {"message": "User deleted successfully."}
-        except Exception as e:
-            db.rollback()
-            logger.error(f"Internal Server Error: {str(e)}") 
-            raise HTTPException(status_code=500, detail="Internal Server Error")
-    else:
-        raise HTTPException(status_code=403, detail=f"No permission to to action.")
+async def delete_user(user_email: str, caller: CurrentUser = Depends(require_admin), db: Session = Depends(get_db)):
+    try:
+        query = select(NewUsers).where(cast(NewUsers.email, String) == cast(user_email, String))
+        result = db.execute(query)
+        user = result.fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found in new_users")
+        delete_query = delete(NewUsers).where(cast(NewUsers.email, String) == cast(user_email, String))
+        db.execute(delete_query)
+        db.commit()
+        return {"message": "User deleted successfully."}
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Internal Server Error: {str(e)}") 
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
 # Function to report a user in validation
 @app.post("/validation/report_user/{user_email}")
-async def report_user(user_email: str, role: str = Depends(get_current_role), db: Session = Depends(get_db)):
-    if role not in ('admin', 'teacher'):
-        raise HTTPException(status_code=403, detail="Access denied.")
+async def report_user(user_email: str, user: CurrentUser = Depends(require_member), db: Session = Depends(get_db)):
     try:
         update_query = update(NewUsers).where(cast(NewUsers.email, String) == cast(user_email, String)).values(report=1)
         db.execute(update_query)
@@ -1391,9 +1369,7 @@ async def report_user(user_email: str, role: str = Depends(get_current_role), db
 
 # Endpoint to mark that a new users has been emailed
 @app.post("/validation/emailed_user/{user_email}")
-async def emailed_user(user_email: str, role: str = Depends(get_current_role), db: Session = Depends(get_db)):
-    if role not in ('admin', 'teacher'):
-        raise HTTPException(status_code=403, detail="Access denied.")
+async def emailed_user(user_email: str, user: CurrentUser = Depends(require_member), db: Session = Depends(get_db)):
     try:
         update_query = update(NewUsers).where(cast(NewUsers.email, String) == cast(user_email, String)).values(emailed=1)
         db.execute(update_query)
@@ -1473,9 +1449,7 @@ async def index_teachers(state: str = Form(...),county: str = Form(None),distric
         )
 
 @app.post("/admin/generate_teacher_report/")
-async def generate_teacher_report(state: str = Form(...), county: str = Form(None), district: str = Form(None), school: str = Form(None), role: str = Depends(get_current_role), db: Session = Depends(get_db)):
-    if role != 'admin':
-        raise HTTPException(status_code=403, detail="Access denied: Only administrators can generate reports.")
+async def generate_teacher_report(state: str = Form(...), county: str = Form(None), district: str = Form(None), school: str = Form(None), caller: CurrentUser = Depends(require_admin), db: Session = Depends(get_db)):
     try:
         # Step 1: Dynamically filter TeacherList based on provided fields (excluding regUserID)
         query = select(
@@ -1596,9 +1570,8 @@ async def get_promo_info(request: Request):
 
 @app.post("/forum/create_post")
 @limiter.limit("5/minute")
-def create_post(request: Request, title: str = Form(...), content: str = Form(...), user_id: int = Depends(get_current_id), db: Session = Depends(get_db)):
-    if not user_id:
-        raise HTTPException(status_code=401, detail="You must be logged in to post.")
+def create_post(request: Request, title: str = Form(...), content: str = Form(...), user: CurrentUser = Depends(require_login), db: Session = Depends(get_db)):
+    user_id = user.id
     # 1. Create a new ForumPost instance
     new_post = ForumPost(
         title=bleach.clean(title, tags=ALLOWED_TAGS, attributes=ALLOWED_ATTRS, strip=True),
@@ -1677,9 +1650,8 @@ def get_post(post_id: int, db: Session = Depends(get_db)):
         )
 
 @app.post("/forum/posts/{post_id}/vote")
-def handle_post_vote(post_id: int, vote_data: VoteInput, user_id: int = Depends(get_current_id), db: Session = Depends(get_db)):
-    if not user_id:
-        raise HTTPException(status_code=401, detail="You must be logged in to post.")
+def handle_post_vote(post_id: int, vote_data: VoteInput, user: CurrentUser = Depends(require_login), db: Session = Depends(get_db)):
+    user_id = user.id
 
     vote_type = vote_data.vote_type
 
@@ -1745,9 +1717,8 @@ def handle_post_vote(post_id: int, vote_data: VoteInput, user_id: int = Depends(
 
 @app.post("/forum/posts/{post_id}/comment", summary="Add a new comment to a specific post")
 @limiter.limit("5/minute")
-def add_comment_to_post(request: Request, post_id: int, content: str = Form(...), parent_comment_id: Optional[int] = Form(None), user_id: int = Depends(get_current_id), db: Session = Depends(get_db)):
-    if not user_id:
-        raise HTTPException(status_code=401, detail="You must be logged in to post.")
+def add_comment_to_post(request: Request, post_id: int, content: str = Form(...), parent_comment_id: Optional[int] = Form(None), user: CurrentUser = Depends(require_login), db: Session = Depends(get_db)):
+    user_id = user.id
 
     # 1. Check if the parent post exists
     post = db.query(ForumPost).filter(ForumPost.id == post_id).first()
@@ -1827,18 +1798,10 @@ def get_comments_for_post(post_id: int = Path(..., gt=0), db: Session = Depends(
             detail="Could not retrieve comments due to a server error."
         )
 @app.delete("/forum/post/{post_id}/delete")
-def delete_post(post_id: int, role: str = Depends(get_current_role), db: Session = Depends(get_db)):
+def delete_post(post_id: int, user: CurrentUser = Depends(require_admin), db: Session = Depends(get_db)):
     """
     Deletes a post. Only allowed for role = 'admin'.
     """
-    # 1. Authorization Check (Admin Only)
-    if role != 'admin':
-        print(f"User attempted unauthorized post deletion.")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, 
-            detail="Access denied: Only administrators can delete posts."
-        )
-
     # 2. Find the post
     post = db.query(ForumPost).filter(ForumPost.id == post_id).first()
     if not post:
@@ -1852,7 +1815,7 @@ def delete_post(post_id: int, role: str = Depends(get_current_role), db: Session
     return
 
 @app.delete("/forum/comment/{comment_id}/delete")
-def delete_comment(comment_id: int, current_user_id: int = Depends(get_current_id),role: str = Depends(get_current_role), db: Session = Depends(get_db)):
+def delete_comment(comment_id: int, user: CurrentUser = Depends(require_admin), db: Session = Depends(get_db)):
     """
     Deletes a comment. Only allowed for admin OR the comment's author (not yet but can be if you uncomment below)
     """
@@ -1865,15 +1828,8 @@ def delete_comment(comment_id: int, current_user_id: int = Depends(get_current_i
             detail="Comment not found"
         )
     
-    # 2. Authorization Check (Admin OR Author)
-    is_admin = (role == 'admin')
-    #is_author = (comment.user_id == current_user_id)
-    
-    if not (is_admin): # or is_author):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, 
-            detail="Access denied: You can only delete your own comments or be an administrator."
-        )
+    # Admins only. To let authors delete their own comments, switch the
+    # dependency to require_login and check comment.user_id == user.id.
 
     # 3. Denormalization: Decrement the parent post's comment count
     post = db.query(ForumPost).filter(ForumPost.id == comment.post_id).first()
@@ -1929,7 +1885,9 @@ async def update_post(post_id: int, post_data: PostUpdate, id: int = Depends(get
         # Note: We use response_model=PostUpdate for simplicity, 
         # but in a real app, you might use your full Post schema if it includes more fields.
         return existing_post
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback() # Rollback the transaction on any error
         # In a production environment, log the error 'e' here
@@ -1966,7 +1924,9 @@ async def update_comment(comment_id: int, content: str = Form(...), user: int = 
         
         # Return the updated object (FastAPI handles JSON conversion)
         return existing_comment
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail="Internal server error during comment update.")
@@ -1974,17 +1934,13 @@ async def update_comment(comment_id: int, content: str = Form(...), user: int = 
 
 
 @app.post("/profile/delete/")
-async def admin_delete_user_account(target_email: str = Form(...), admin_secret_input: str = Form(...),current_role: str = Depends(get_current_role), db: Session = Depends(get_db)):
+async def admin_delete_user_account(target_email: str = Form(...), admin_secret_input: str = Form(...), user: CurrentUser = Depends(require_admin), db: Session = Depends(get_db)):
     """
     Allows an authenticated 'admin' user to delete *any* user account 
     by providing the target user's email and a secret key via form submission.
     Deletes the associated teacher entry and the registered user account.
     """
     
-    # 1. ROLE CHECK: Ensure the current user is an admin
-    if not current_role or current_role != 'admin':
-        raise HTTPException(status_code=403, detail="Forbidden. Only administrators can delete user accounts.")
-
     # 2. SECRET CHECK: Ensure the provided secret matches the server configuration
     ADMIN_SECRET = settings.admin_secret
     
@@ -2037,16 +1993,13 @@ async def create_admin_account(
     password: str = Form(...),
     confirm_password: str = Form(...),
     admin_secret_input: str = Form(...),
-    current_role: str = Depends(get_current_role), db: Session = Depends(get_db)
+    user: CurrentUser = Depends(require_admin), db: Session = Depends(get_db)
 ):
     """
     Allows an authenticated 'admin' user, who also supplies the server's admin
     secret, to create a brand new admin account directly in registered_users.
     Only email, password, and role are stored; id is auto-assigned by the DB.
     """
-    # 1. ROLE CHECK: Only an existing admin may create another admin
-    if not current_role or current_role != 'admin':
-        raise HTTPException(status_code=403, detail="Forbidden. Only administrators can create admin accounts.")
 
     # 2. SECRET CHECK: Same server secret used for other sensitive admin actions
     ADMIN_SECRET = settings.admin_secret
