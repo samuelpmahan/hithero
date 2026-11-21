@@ -16,3 +16,11 @@ testenv.configure()
 def update_golden() -> bool:
     """True when the run should rewrite golden files instead of comparing."""
     return testenv.update_golden()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Leave the database freshly seeded if any test wrote to it."""
+    from tests import helpers
+
+    if helpers.db_dirty:
+        helpers.reseed()
