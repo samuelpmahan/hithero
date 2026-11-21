@@ -15,6 +15,7 @@ pydantic
 SQLAlchemy
 greenlet
 pyodbc
+argon2-cffi
 passlib
 requests
 azure-communication-email

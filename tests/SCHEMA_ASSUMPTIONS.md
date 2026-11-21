@@ -37,6 +37,8 @@ note whether it matches.
 | B9 | `image_data` is `VARBINARY(max)` and `last_TOD`/`created_at` are `DATETIME` | `IMAGE`, `DATETIME2` | Mostly invisible; `DATETIME2` keeps more precision. |
 | B10 | Ids are `IDENTITY` starting at 1 | Same, but with existing data | Only the seeded ids matter in the tests. |
 | B11 | No extra tables, columns, triggers or views that the code relies on | Any of these | Unknown. |
+| B12 | `registered_users.password` and `new_users.password` hold at least 97 characters (argon2id hashes, from BE2-11) | A shorter limit (sha256_crypt hashes are about 77) | New passwords would fail to save. Login keeps working: a failed hash upgrade is logged and skipped. |
+| B13 | `password_reset_tokens.token` holds at least 43 characters | Shorter | BE2-11 stores a 43-character hash, the same length as the tokens stored before, so this is unchanged. |
 
 ## Server
 

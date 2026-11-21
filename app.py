@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.applications import Starlette
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.responses import FileResponse
-from passlib.hash import sha256_crypt
+from auth.passwords import hash_password, verify_password
 from sqlalchemy.orm import Session
 from typing import Optional, List
 from azure.communication.email import EmailClient
@@ -572,7 +572,7 @@ async def register_user(request: Request, name: str = Form(...), email: str = Fo
             return {"message": "User with this email is already in the registration queue."}
         if password != confirm_password:
             return {"message": "Password do not match."}
-        hashed_password = sha256_crypt.hash(password)
+        hashed_password = hash_password(password)
         role = 'teacher'
         users.add_pending(db, name=name, email=email, state=state, county=county, district=district, school=school, phone_number=phone_number, password=hashed_password, role=role, report=0, emailed=0)
         db.commit()
@@ -590,8 +590,17 @@ async def login_user(request: Request, email: str = Form(...), password: str = F
     try:
         user = users.get_by_email(db, email)
         if user:
-            hashed_password = user.password
-            if sha256_crypt.verify(password, hashed_password):
+            ok, upgraded_hash = verify_password(password, user.password)
+            if ok:
+                if upgraded_hash:
+                    # Move legacy sha256_crypt hashes to argon2 on login. A
+                    # failed save must not block the login itself.
+                    try:
+                        users.set_password_by_id(db, user.id, upgraded_hash)
+                        db.commit()
+                    except Exception as e:
+                        db.rollback()
+                        logger.warning(f"Password hash upgrade failed for user {user.id}: {e}")
                 message = "Login successful as " + user.role
                 request.session["user_email"] = email
                 request.session["user_role"] = user.role
@@ -961,8 +970,8 @@ async def update_password(request: Request, id: int = Depends(get_current_id), o
     try:
         if new_password == new_password_confirmed:
             old_pass = users.password_hash(db, id)
-            if old_pass and sha256_crypt.verify(old_password, old_pass):
-                hashed_new_password = sha256_crypt.hash(new_password)
+            if verify_password(old_password, old_pass)[0]:
+                hashed_new_password = hash_password(new_password)
                 users.set_password_by_id(db, id, hashed_new_password)
                 db.commit()
                 return {"status": "success", "message": "Password updated successfully"}
@@ -1095,7 +1104,7 @@ async def reset_password(token: str = Form(...), new_password: str = Form(...), 
         if not reset:
             raise HTTPException(status_code=400, detail="Invalid or expired reset token.")
         # Update the password
-        hashed = sha256_crypt.hash(new_password)
+        hashed = hash_password(new_password)
         users.set_password_by_email(db, reset.email, hashed)
         # Mark token as used
         reset.used = 1
@@ -1796,7 +1805,7 @@ async def create_admin_account(
             raise HTTPException(status_code=400, detail="An account with this email already exists.")
 
         # 5. Create the admin account directly in registered_users (id auto-assigned by the DB)
-        hashed_password = sha256_crypt.hash(password)
+        hashed_password = hash_password(password)
         users.create_admin(db, email, hashed_password)
         db.commit()
         return {"message": f"Admin account created successfully for {email}."}

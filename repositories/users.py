@@ -5,6 +5,7 @@ import datetime
 from sqlalchemy import String, cast, delete, insert, select, update
 from sqlalchemy.orm import Session
 
+from auth.passwords import hash_reset_token
 from models import NewUsers, PasswordResetToken, RegisteredUsers, TeacherList
 
 
@@ -143,12 +144,13 @@ def flag_pending(db: Session, email: str, **flags) -> None:
 # Password reset tokens
 
 def add_reset_token(db: Session, email: str, token: str, expires_at: datetime.datetime) -> None:
-    db.add(PasswordResetToken(email=email, token=token, expires_at=expires_at))
+    """Store only the token's hash; the plain token goes in the email."""
+    db.add(PasswordResetToken(email=email, token=hash_reset_token(token), expires_at=expires_at))
 
 
 def get_usable_reset_token(db: Session, token: str, now: datetime.datetime) -> PasswordResetToken | None:
     return db.query(PasswordResetToken).filter(
-        PasswordResetToken.token == token,
+        PasswordResetToken.token == hash_reset_token(token),
         PasswordResetToken.used == 0,
         PasswordResetToken.expires_at > now,
     ).first()
