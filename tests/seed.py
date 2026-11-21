@@ -76,6 +76,7 @@ def seed() -> None:
     )
 
     app_module.PasswordResetToken.__table__.c.token.type = sqlalchemy.String(255)
+    app_module.engine.dispose()  # drop connections to the old database
     testenv.real_create_all(app_module.Base.metadata, bind=app_module.engine)
 
     # Low rounds keep seeding fast; verify() reads the rounds from the hash.
