@@ -48,10 +48,13 @@ def decode_session(cookie: str | None) -> dict:
     return json.loads(base64.b64decode(payload))
 
 
-def client(session: dict | None = None) -> TestClient:
+def client(session: dict | None = None, raise_errors: bool = True) -> TestClient:
+    """A test client. By default a server error raises in the test; pass
+    raise_errors=False to get the 500 answer the app's error handler sends."""
     import app as app_module
 
-    c = TestClient(app_module.app, base_url="https://testserver", follow_redirects=False)
+    c = TestClient(app_module.app, base_url="https://testserver", follow_redirects=False,
+                   raise_server_exceptions=raise_errors)
     if session:
         c.cookies.set("session", encode_session(session), domain="testserver.local")
     return c

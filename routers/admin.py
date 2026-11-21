@@ -1,7 +1,6 @@
 """Admin-only tools: teacher report, account deletion, new admin accounts."""
 
 import io
-import logging
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -17,72 +16,65 @@ from ratelimit import limiter
 from repositories import teachers, users
 from services import accounts
 
-logger = logging.getLogger("app")
 router = APIRouter()
 
 
 @router.post("/admin/generate_teacher_report/")
 async def generate_teacher_report(state: str = Form(...), county: str = Form(None), district: str = Form(None), school: str = Form(None), caller: CurrentUser = Depends(require_admin), db: Session = Depends(get_db)):
-    try:
-        # Step 1: Dynamically filter TeacherList based on provided fields (excluding regUserID)
-        report_teachers = teachers.report_rows(db, state, county, district, school)
+    # Step 1: Dynamically filter TeacherList based on provided fields (excluding regUserID)
+    report_teachers = teachers.report_rows(db, state, county, district, school)
 
-        if not report_teachers:
-            raise HTTPException(status_code=404, detail="No teachers found with the specified criteria.")
+    if not report_teachers:
+        raise HTTPException(status_code=404, detail="No teachers found with the specified criteria.")
 
-        # Step 2: Fetch email and phone from RegisteredUsers using regUserID
-        reg_user_ids = [teacher.regUserID for teacher in report_teachers]
-        contacts = users.contacts_by_id(db, reg_user_ids)
+    # Step 2: Fetch email and phone from RegisteredUsers using regUserID
+    reg_user_ids = [teacher.regUserID for teacher in report_teachers]
+    contacts = users.contacts_by_id(db, reg_user_ids)
 
-        # Step 3: Map teachers to their corresponding user data (email and phone)
-        user_dict = {c.id: {"email": c.email, "phone": c.phone_number} for c in contacts}
+    # Step 3: Map teachers to their corresponding user data (email and phone)
+    user_dict = {c.id: {"email": c.email, "phone": c.phone_number} for c in contacts}
 
-        table_data = [["Name", "School", "Email", "Phone"]]
-        for teacher in report_teachers:
-            table_data.append([
-                teacher.name or "",
-                teacher.school or "",
-                user_dict.get(teacher.regUserID, {}).get('email', 'N/A'),
-                user_dict.get(teacher.regUserID, {}).get('phone', 'N/A'),
-            ])
+    table_data = [["Name", "School", "Email", "Phone"]]
+    for teacher in report_teachers:
+        table_data.append([
+            teacher.name or "",
+            teacher.school or "",
+            user_dict.get(teacher.regUserID, {}).get('email', 'N/A'),
+            user_dict.get(teacher.regUserID, {}).get('phone', 'N/A'),
+        ])
 
-        # Step 4: Build the PDF in memory
-        buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=letter)
-        styles = getSampleStyleSheet()
-        story = [Paragraph("Teacher Report", styles['Title']), Spacer(1, 12)]
+    # Step 4: Build the PDF in memory
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    styles = getSampleStyleSheet()
+    story = [Paragraph("Teacher Report", styles['Title']), Spacer(1, 12)]
 
-        table = Table(table_data, repeatRows=1)
-        table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#2c3e50")),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 9),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor("#f2f2f2")]),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('TOPPADDING', (0, 0), (-1, -1), 4),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-        ]))
-        story.append(table)
-        doc.build(story)
-        buffer.seek(0)
+    table = Table(table_data, repeatRows=1)
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#2c3e50")),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor("#f2f2f2")]),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+    ]))
+    story.append(table)
+    doc.build(story)
+    buffer.seek(0)
 
-        # Step 5: Stream the PDF back to the browser as a download
-        return StreamingResponse(
-            buffer,
-            media_type="application/pdf",
-            headers={"Content-Disposition": "attachment; filename=teacher_report.pdf"}
-        )
+    # Step 5: Stream the PDF back to the browser as a download
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=teacher_report.pdf"}
+    )
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Report generation error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
         
-
-
 @router.post("/profile/delete/")
 async def admin_delete_user_account(target_email: str = Form(...), admin_secret_input: str = Form(...), user: CurrentUser = Depends(require_admin), db: Session = Depends(get_db)):
     """
@@ -91,14 +83,7 @@ async def admin_delete_user_account(target_email: str = Form(...), admin_secret_
     Deletes the associated teacher entry and the registered user account.
     """
     accounts.check_admin_secret(admin_secret_input)
-    try:
-        accounts.delete_account(db, target_email)
-    except HTTPException:
-        raise
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Internal Server Error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+    accounts.delete_account(db, target_email)
     return {"message": f"Successfully deleted account and associated data for target user: {target_email}."}
 
 
@@ -119,12 +104,5 @@ async def create_admin_account(
     """
     accounts.check_admin_secret(admin_secret_input)
     accounts.check_new_admin_password(password, confirm_password)
-    try:
-        accounts.create_admin(db, email, password)
-    except HTTPException:
-        raise
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Error creating admin account: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+    accounts.create_admin(db, email, password)
     return {"message": f"Admin account created successfully for {email}."}
