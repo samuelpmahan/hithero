@@ -80,12 +80,14 @@ class _DonePoller:
 @pytest.fixture
 def outbox(monkeypatch) -> FakeEmailClient:
     """Replace the Azure email client; the fixture's .sent lists messages."""
-    import app as app_module
+    import emails
+    from auth import recaptcha
 
     fake = FakeEmailClient()
-    monkeypatch.setattr(app_module.EmailClient, "from_connection_string",
+
+    monkeypatch.setattr(emails.EmailClient, "from_connection_string",
                         staticmethod(lambda conn: fake))
-    monkeypatch.setattr(app_module, "verify_recaptcha", lambda response: True)
+    monkeypatch.setattr(recaptcha, "verify_recaptcha", lambda response: True)
     return fake
 
 

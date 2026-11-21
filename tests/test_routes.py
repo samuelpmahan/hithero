@@ -17,11 +17,26 @@ from tests.conftest import update_golden
 GOLDEN = Path(__file__).parent / "golden" / "routes.txt"
 
 
+def _flatten(routes):
+    """Yield routes, descending into included routers.
+
+    FastAPI >= 0.16x keeps an included router as one entry whose
+    original_router holds its routes. The app includes routers without a
+    prefix, so their paths are the served paths.
+    """
+    for route in routes:
+        included = getattr(route, "original_router", None)
+        if included is not None:
+            yield from _flatten(included.routes)
+        else:
+            yield route
+
+
 def collect_routes() -> list[str]:
     import app as app_module
 
     lines = set()
-    for route in app_module.app.routes:
+    for route in _flatten(app_module.app.routes):
         if isinstance(route, APIRoute):
             for method in route.methods:
                 lines.add(f"{method} {route.path}")

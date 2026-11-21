@@ -46,23 +46,23 @@ def check_golden(name: str, messages: list[dict]) -> None:
 
 
 def test_registration_email(outbox):
-    import app
+    import emails
 
-    app.send_registration_email("new.teacher@example.com")
+    emails.send_registration_email("new.teacher@example.com")
     check_golden("registration", outbox.sent)
 
 
 def test_validation_email(outbox):
-    import app
+    import emails
 
-    app.send_validation_email("new.teacher@example.com")
+    emails.send_validation_email("new.teacher@example.com")
     check_golden("validation", outbox.sent)
 
 
 def test_teacher_of_the_day_email(outbox):
-    import app
+    import emails
 
-    app.send_teacher_of_the_day_email("alice@example.com", "Alice Adams", "alice1234")
+    emails.send_teacher_of_the_day_email("alice@example.com", "Alice Adams", "alice1234")
     check_golden("teacher_of_the_day", outbox.sent)
 
 
@@ -80,9 +80,9 @@ def test_contact_us_email(outbox):
 @requires_db
 def test_pending_validation_email(outbox):
     """Wednesday job: tells teachers in a district who is waiting."""
-    import app
+    import jobs
 
-    app.wednesday_job()
+    jobs.wednesday_job()
     outbox.sent.sort(key=lambda m: m["recipients"]["to"][0]["address"])
     check_golden("pending_validation", outbox.sent)
 
@@ -90,26 +90,28 @@ def test_pending_validation_email(outbox):
 @requires_db
 def test_profile_reminder_email(outbox):
     """Tuesday job: validated users who have not made a profile."""
-    import app
+    import jobs
 
-    app.tuesday_job()
+    jobs.tuesday_job()
     check_golden("profile_reminder", outbox.sent)
 
 
 @requires_db
 def test_validation_reminder_email(outbox):
     """Thursday job: registered users still waiting for validation."""
-    import app
+    import jobs
 
-    app.thursday_job()
+    jobs.thursday_job()
     check_golden("validation_reminder", outbox.sent)
 
 
 @requires_db
 def test_password_reset_email(outbox, monkeypatch):
+    import secrets
+
     import app
 
-    monkeypatch.setattr(app.secrets, "token_urlsafe", lambda n: FIXED_TOKEN)
+    monkeypatch.setattr(secrets, "token_urlsafe", lambda n: FIXED_TOKEN)
     c = helpers.client()
     response = c.post("/profile/forgot_password/", data={"email": "bob@example.com"})
     assert response.status_code == 200
@@ -117,9 +119,10 @@ def test_password_reset_email(outbox, monkeypatch):
         check_golden("password_reset", outbox.sent)
     finally:
         # Leave the seeded database as it was for other tests.
+        from auth.passwords import hash_reset_token
         from models import PasswordResetToken
 
         db = app.SessionLocal()
-        db.query(PasswordResetToken).filter(PasswordResetToken.token == FIXED_TOKEN).delete()
+        db.query(PasswordResetToken).filter(PasswordResetToken.token == hash_reset_token(FIXED_TOKEN)).delete()
         db.commit()
         db.close()
