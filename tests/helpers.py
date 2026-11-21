@@ -59,3 +59,31 @@ def client(session: dict | None = None) -> TestClient:
 
 def session_of(c: TestClient) -> dict:
     return decode_session(c.cookies.get("session"))
+
+
+class FakeEmailClient:
+    """Stands in for azure EmailClient and records every message sent."""
+
+    def __init__(self):
+        self.sent: list[dict] = []
+
+    def begin_send(self, message: dict):
+        self.sent.append(message)
+        return _DonePoller()
+
+
+class _DonePoller:
+    def result(self):
+        return {"status": "Succeeded", "id": "fake"}
+
+
+@pytest.fixture
+def outbox(monkeypatch) -> FakeEmailClient:
+    """Replace the Azure email client; the fixture's .sent lists messages."""
+    import app as app_module
+
+    fake = FakeEmailClient()
+    monkeypatch.setattr(app_module.EmailClient, "from_connection_string",
+                        staticmethod(lambda conn: fake))
+    monkeypatch.setattr(app_module, "verify_recaptcha", lambda response: True)
+    return fake
