@@ -10,6 +10,7 @@ They assert today's behaviour, so the refactor can't change it silently.
 When a task changes behaviour on purpose, the assertion changes with it.
 """
 import re
+import time
 
 import pytest
 
@@ -143,7 +144,7 @@ def test_forgot_and_reset_password(fresh_db, monkeypatch):
     assert len(stored) == 1 and len(stored[0]) == len(token) == 43
 
     # Unknown address: same answer, no email.
-    monkeypatch.setattr(app.time, "sleep", lambda s: None)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
     sent_before = len(outbox.sent)
     r = visitor.post("/profile/forgot_password/", data={"email": "nobody@example.com"})
     assert r.json() == {"message": "If an account exists, a reset link will be sent to your email."}
@@ -242,10 +243,10 @@ def test_delete_post_with_comments(fresh_db):
 def test_daily_teacher_of_the_day_job(fresh_db):
     """Daily job: picks a teacher, stamps last_TOD, emails them, and the
     homepage's teacher of the day becomes that teacher."""
-    import app
+    import jobs
 
     outbox = fresh_db
-    app.daily_job()
+    jobs.daily_job()
     assert len(outbox.sent) == 1
     message = outbox.sent[0]
     assert message["content"]["subject"] == "🎉 You're Today's Homeroom Hero!"
