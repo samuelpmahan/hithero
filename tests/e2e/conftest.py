@@ -16,6 +16,7 @@ Needs: pip install pytest-playwright && playwright install chromium
 (or set PLAYWRIGHT_CHROMIUM_EXECUTABLE to an installed Chromium).
 """
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -81,6 +82,24 @@ def site_url():
 def browser_type_launch_args(browser_type_launch_args):
     exe = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE")
     return {**browser_type_launch_args, **({"executable_path": exe} if exe else {})}
+
+
+# Ads and analytics the pages load. Blocked in every run: against the live
+# site these requests hang behind some proxies (so "networkidle" never
+# comes), and each page view would otherwise reach Google Ads as a real
+# page view or conversion, skewing the site's ad numbers.
+TRACKERS = re.compile(
+    r"^https?://([^/]*\.)?("
+    r"googletagmanager\.com|google-analytics\.com|googleadservices\.com|"
+    r"doubleclick\.net|googlesyndication\.com|adtrafficquality\.google"
+    r")/|^https?://www\.google\.com/(ccm|rmkt|pagead)/"
+)
+
+
+@pytest.fixture
+def context(context):
+    context.route(TRACKERS, lambda route: route.abort())
+    return context
 
 
 @dataclass
