@@ -2,7 +2,6 @@
 
 Include this router last: GET /{token} matches every one-segment path."""
 
-import logging
 import os
 
 import bleach
@@ -13,7 +12,6 @@ from auth import recaptcha
 from config import settings
 from emails import render_email_template, send_email
 
-logger = logging.getLogger("app")
 router = APIRouter()
 
 
@@ -70,12 +68,8 @@ async def contact_us(name: str = Form(...), email: str = Form(...), subject: str
     )
 
     recipient_email = 'Homeroom.heroes.contact@gmail.com'
-    try:
-        send_email(recipient_email, clean_subject, html_message, plain_message)
-        return {"message": "Email sent successfully!"}
-    except Exception as e:
-        logger.error(f"Internal Server Error: {str(e)}") 
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+    send_email(recipient_email, clean_subject, html_message, plain_message)
+    return {"message": "Email sent successfully!"}
 
 #homepage get
 @router.get("/")

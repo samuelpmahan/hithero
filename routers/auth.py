@@ -33,17 +33,13 @@ async def register_user(request: Request, name: str = Form(...), email: str = Fo
 @router.post("/profile/login/")
 @limiter.limit("5/minute")
 async def login_user(request: Request, email: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
-    try:
-        user = accounts.authenticate(db, email, password)
-        if not user:
-            return JSONResponse(content={"message": "Invalid login credentials."})
-        request.session["user_email"] = email
-        request.session["user_role"] = user.role
-        request.session["user_id"] = user.id
-        return JSONResponse(content={"message": "Login successful as " + user.role, "createCount": user.createCount, "role": user.role})
-    except Exception as e:
-        logger.error(f"Internal Server Error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+    user = accounts.authenticate(db, email, password)
+    if not user:
+        return JSONResponse(content={"message": "Invalid login credentials."})
+    request.session["user_email"] = email
+    request.session["user_role"] = user.role
+    request.session["user_id"] = user.id
+    return JSONResponse(content={"message": "Login successful as " + user.role, "createCount": user.createCount, "role": user.role})
 
 
 @router.post("/profile/logout/")
@@ -58,24 +54,12 @@ async def logout_user(request: Request):
 @router.post("/profile/forgot_password/")
 @limiter.limit("5/minute")
 async def forgot_password(request: Request, email: str = Form(...), db: Session = Depends(get_db)):
-    try:
-        if not accounts.request_password_reset(db, email):
-            time.sleep(1)  # unknown address: take about as long, answer the same
-        return JSONResponse(content={"message": "If an account exists, a reset link will be sent to your email."})
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Internal Server Error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+    if not accounts.request_password_reset(db, email):
+        time.sleep(1)  # unknown address: take about as long, answer the same
+    return JSONResponse(content={"message": "If an account exists, a reset link will be sent to your email."})
 
 
 @router.post("/profile/reset_password/")
 async def reset_password(token: str = Form(...), new_password: str = Form(...), confirm_password: str = Form(...), db: Session = Depends(get_db)):
-    try:
-        accounts.reset_password(db, token, new_password, confirm_password)
-        return JSONResponse(content={"message": "Password reset successfully. You can now log in."})
-    except HTTPException:
-        raise
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Internal Server Error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+    accounts.reset_password(db, token, new_password, confirm_password)
+    return JSONResponse(content={"message": "Password reset successfully. You can now log in."})

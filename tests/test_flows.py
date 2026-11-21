@@ -227,17 +227,21 @@ def test_forum_post_comment_vote_edit_delete(fresh_db):
     assert helpers.client().get(f"/forum/get_post?post_id={post_id}").json()["comment_count"] == 1
 
 
-def test_delete_post_with_comments(fresh_db):
+def test_delete_post_with_comments(fresh_db, caplog):
     """Deleting a post that still has comments or votes.
 
     The handler's comment says the database cascades, but the models
     declare no ON DELETE CASCADE, so the delete fails. This records
     today's behaviour; BE2-8 decides what it should do.
     """
-    admin = helpers.client()
+    admin = helpers.client(raise_errors=False)
     login(admin, "admin@example.com")
-    with pytest.raises(Exception, match="REFERENCE constraint"):
-        admin.delete("/forum/post/1/delete")
+    r = admin.delete("/forum/post/1/delete")
+    assert r.status_code == 500
+    assert r.json() == {"detail": "Internal Server Error"}
+    # BE3-4: the one error handler logs the path and the cause.
+    assert "DELETE /forum/post/1/delete" in caplog.text
+    assert "REFERENCE constraint" in caplog.text
 
 
 def test_daily_teacher_of_the_day_job(fresh_db):
@@ -348,7 +352,7 @@ def test_validation_actions(fresh_db):
 
 
 def test_admin_report_and_account_actions(fresh_db):
-    admin = helpers.client()
+    admin = helpers.client(raise_errors=False)
     login(admin, "admin@example.com")
 
     r = admin.post("/admin/generate_teacher_report/", data={"state": "Illinois", "county": "Sangamon"})

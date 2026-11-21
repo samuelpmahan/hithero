@@ -5,11 +5,12 @@ live in routers/, queries in repositories/, emails in emails.py and the
 scheduled jobs in jobs.py.
 """
 
+import logging
 import os
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -30,6 +31,8 @@ from routers import (
     teachers,
     validation,
 )
+
+logger = logging.getLogger("app")
 
 app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key=settings.secret_key, https_only=True)
@@ -71,6 +74,13 @@ async def not_found(request: Request, exc: HTTPException):
 @app.exception_handler(403)
 async def forbidden(request: Request, exc: HTTPException):
     return _error_page("403.html", 403)
+
+
+@app.exception_handler(Exception)
+async def server_error(request: Request, exc: Exception):
+    """The one catch-all: log the failure with the request path, answer 500."""
+    logger.error(f"Internal Server Error on {request.method} {request.url.path}: {exc!r}", exc_info=exc)
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
 
 if __name__ == "__main__":
