@@ -13,6 +13,7 @@ import re
 
 import pytest
 
+from models import RegisteredUsers, TeacherList
 from tests import helpers
 from tests.helpers import fresh_db, no_rate_limits, outbox, requires_db  # noqa: F401  (fixtures)
 from tests.seed import SEED_PASSWORD
@@ -80,8 +81,8 @@ def test_create_profile_and_open_teacher_page(fresh_db):
     import app
 
     db = app.SessionLocal()
-    db.add(app.RegisteredUsers(email="erin@example.com", phone_number="5553334444",
-                               password=db.query(app.RegisteredUsers.password).first()[0],
+    db.add(RegisteredUsers(email="erin@example.com", phone_number="5553334444",
+                               password=db.query(RegisteredUsers.password).first()[0],
                                role="teacher", createCount=0))
     db.commit()
     db.close()
@@ -109,7 +110,7 @@ def test_create_profile_and_open_teacher_page(fresh_db):
                         "school": "Alamo Elementary", "teacher": "Erin Evans"}
 
     db = app.SessionLocal()
-    url_id = db.query(app.TeacherList.url_id).filter(app.TeacherList.name == "Erin Evans").scalar()
+    url_id = db.query(TeacherList.url_id).filter(TeacherList.name == "Erin Evans").scalar()
     db.close()
     assert re.fullmatch(r"erin\d{1,4}", url_id)
 
@@ -281,3 +282,104 @@ def test_denied_calls_return_403(no_rate_limits, who, method, path, data):
         login(c, who)
     r = getattr(c, method)(path, data=data) if data else getattr(c, method)(path)
     assert r.status_code == 403, f"{path} answered {r.status_code}"
+
+
+PNG_1PX = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
+    "1f15c4890000000d4944415478da63f8ffff3f0005fe02fea7d6a4c80000000049454e44ae426082"
+)
+
+
+def test_teacher_profile_edits(fresh_db):
+    alice = helpers.client()
+    login(alice, "alice@example.com")
+    assert alice.post("/profile/update_info/", data={"aboutMe": "New about."}).json() == {"message": "Info updated."}
+    assert alice.post("/profile/update_teacher_name/", data={"teacher": "Alice A."}).json() == {"message": "Name updated."}
+    assert alice.post("/profile/update_wishlist/", data={"wishlist": "https://a.co/new"}).json() == {"message": "Wishlist updated."}
+    r = alice.post("/profile/update_teacher_school/", data={
+        "state": "Illinois", "county": "Sangamon", "district": "Springfield District", "school": "Douglas Middle"})
+    assert r.json() == {"message": "School information updated successfully."}
+    assert alice.post("/profile/update_url_id/", data={"url_id": "bob5678"}).status_code == 409
+    assert alice.post("/profile/update_url_id/", data={"url_id": "no spaces"}).status_code == 400
+    assert alice.post("/profile/update_url_id/", data={"url_id": "alice-new"}).json() == {"message": "URL ID updated successfully."}
+    r = alice.post("/profile/update_teacher_image/", files={"image": ("a.png", PNG_1PX, "image/png")})
+    assert r.json() == {"message": "Information updated."}
+    r = alice.post("/profile/update_teacher_image/", files={"image": ("a.txt", b"not an image", "text/plain")})
+    assert r.status_code == 400
+
+    visitor = helpers.client()
+    visitor.get("/teacher/alice-new")
+    info = visitor.get("/api/get_teacher_info/").json()
+    assert (info["name"], info["school"], info["about_me"]) == ("Alice A.", "Douglas Middle", "New about.")
+    assert info["wishlist_url"] == "https://a.co/new&tag=h0mer00mher0-20"
+    assert info["image_data"] is not None
+
+
+def test_change_password(fresh_db):
+    bob = helpers.client()
+    login(bob, "bob@example.com")
+    r = bob.post("/profile/update_password/", data={
+        "old_password": "wrong", "new_password": "N3w-pass!", "new_password_confirmed": "N3w-pass!"})
+    assert r.json() == {"message": "Invalid old password"}
+    r = bob.post("/profile/update_password/", data={
+        "old_password": SEED_PASSWORD, "new_password": "N3w-pass!", "new_password_confirmed": "N3w-pass!"})
+    assert r.json() == {"status": "success", "message": "Password updated successfully"}
+    assert login(helpers.client(), "bob@example.com", "N3w-pass!").json()["message"] == "Login successful as teacher"
+
+
+def test_validation_actions(fresh_db):
+    alice, admin = helpers.client(), helpers.client()
+    login(alice, "alice@example.com")
+    login(admin, "admin@example.com")
+    assert alice.post("/validation/report_user/pending@example.com").json() == {"message": "User reported."}
+    assert alice.post("/validation/emailed_user/pending@example.com").json() == {"message": "User emailed."}
+    pending = admin.get("/api/validation_list/").json()["new_users"][0]
+    assert (pending["report"], pending["emailed"]) == (1, 1)
+    assert admin.post("/validation/delete_user/pending@example.com").json() == {"message": "User deleted successfully."}
+    assert admin.get("/api/validation_list/").json()["new_users"] == []
+
+
+def test_admin_report_and_account_actions(fresh_db):
+    admin = helpers.client()
+    login(admin, "admin@example.com")
+
+    r = admin.post("/admin/generate_teacher_report/", data={"state": "Illinois", "county": "Sangamon"})
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "application/pdf"
+    assert r.content.startswith(b"%PDF")
+    assert admin.post("/admin/generate_teacher_report/", data={"state": "Nowhere"}).status_code == 404
+
+    secret = "test-admin-secret"
+    r = admin.post("/admin/create_admin/", data={
+        "email": "admin2@example.com", "password": "Adm1n-pass", "confirm_password": "Adm1n-pass",
+        "admin_secret_input": secret})
+    assert r.json() == {"message": "Admin account created successfully for admin2@example.com."}
+    r = admin.post("/admin/create_admin/", data={
+        "email": "alice@example.com", "password": "Adm1n-pass", "confirm_password": "Adm1n-pass",
+        "admin_secret_input": secret})
+    assert r.status_code == 400
+    r = admin.post("/admin/create_admin/", data={
+        "email": "x@example.com", "password": "Adm1n-pass", "confirm_password": "Adm1n-pass",
+        "admin_secret_input": "wrong"})
+    assert r.status_code == 403
+    assert login(helpers.client(), "admin2@example.com", "Adm1n-pass").json()["message"] == "Login successful as admin"
+
+    # Existing behaviour: deleting an account that still has forum posts,
+    # comments or votes hits the forum foreign keys and returns 500 (see
+    # SCHEMA_ASSUMPTIONS.md; depends on production having those FKs).
+    r = admin.post("/profile/delete/", data={"target_email": "carol@example.com", "admin_secret_input": secret})
+    assert r.status_code == 500
+    import app
+    from models import ForumComment, ForumPost, PostVote
+    with app.SessionLocal() as db:
+        db.query(ForumComment).filter(ForumComment.post_id == 2).delete()
+        db.query(PostVote).filter(PostVote.user_id == 4).delete()
+        db.query(PostVote).filter(PostVote.post_id == 2).delete()
+        db.query(ForumPost).filter(ForumPost.user_id == 4).delete()
+        db.commit()
+    r = admin.post("/profile/delete/", data={"target_email": "carol@example.com", "admin_secret_input": secret})
+    assert r.json() == {"message": "Successfully deleted account and associated data for target user: carol@example.com."}
+    assert login(helpers.client(), "carol@example.com").json() == {"message": "Invalid login credentials."}
+    assert helpers.client().get("/teacher/carol42").headers["location"] == "/pages/404.html"
+    r = admin.post("/profile/delete/", data={"target_email": "nobody@example.com", "admin_secret_input": secret})
+    assert r.status_code == 404

@@ -5,29 +5,16 @@ import os, logging, smtplib, secrets, string, pyodbc, time, ssl, datetime, base6
 from auth.dependencies import CurrentUser, require_admin, require_login, require_member, require_role
 from config import settings
 from db import SessionLocal, engine, get_db
-from models import (
-    Base,
-    ForumComment,
-    ForumPost,
-    NewUsers,
-    PasswordResetToken,
-    PostVote,
-    RegisteredUsers,
-    School,
-    TeacherList,
-)
+from models import Base, ForumComment, ForumPost, PostVote
 from schemas import CreatePostRequest, PostDisplay, PostUpdate, VoteInput
+from repositories import forum, schools, teachers, users
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.applications import Starlette
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.responses import FileResponse
 from passlib.hash import sha256_crypt
-from sqlalchemy import create_engine, Column, Integer, String, func, LargeBinary, DateTime, ForeignKey, UniqueConstraint, select, desc, cast
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session, relationship
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.sql import select, cast, delete, insert, update
+from sqlalchemy.orm import Session
 from typing import Optional, List
 from azure.communication.email import EmailClient
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -119,11 +106,9 @@ def get_index_cookie(index: str, request: Request):
 
 def store_my_cookies(request: Request, id: int, db: Session):
     try:
-        query = select(TeacherList).where(TeacherList.regUserID == id)
-        result = db.execute(query)
-        teacher_data = result.fetchone()
-        if teacher_data:
-            name, state, county, district, school = teacher_data[0].name, teacher_data[0].state, teacher_data[0].county, teacher_data[0].district, teacher_data[0].school
+        teacher = teachers.get_by_user_id(db, id)
+        if teacher:
+            name, state, county, district, school = teacher.name, teacher.state, teacher.county, teacher.district, teacher.school
             request.session["state"] = state
             request.session["county"] = county
             request.session["district"] = district
@@ -245,24 +230,10 @@ def send_validation_email(recipient_email: str):
         plain_message
     )
 
-def update_temp_password(db: Session, email: str, new_password: str):
-    try:
-        hashed_password = sha256_crypt.hash(new_password)
-        query = update(RegisteredUsers).where(cast(RegisteredUsers.email, String) == cast(email, String)).values(password=hashed_password)
-        db.execute(query)
-        db.commit()  
-    except Exception as e:
-        print(f"Error updating password: {e}")
-        raise
-
 # Function to fetch a random teacher from the database
 def fetch_random_teacher(db: Session):
     try:
-        # The scalar_one_or_none() method directly returns the TeacherList object,
-        # or None if no teacher is found.
-        query = select(TeacherList).order_by(func.newid()).limit(1)
-        random_teacher_record = db.execute(query).scalar_one_or_none()
-        return random_teacher_record
+        return teachers.random_teacher(db)
     except Exception as e:
         print(f"Error fetching random teacher: {e}")
         return None
@@ -339,17 +310,11 @@ def daily_job():
 
             # Stamp last_TOD on the chosen teacher so they're excluded from
             # selection for the next 90 days.
-            update_query = (
-                update(TeacherList)
-                .where(TeacherList.id == chosen_teacher.id)
-                .values(last_TOD=datetime.datetime.utcnow())
-            )
-            db.execute(update_query)
+            teachers.stamp_teacher_of_the_day(db, chosen_teacher.id, datetime.datetime.utcnow())
             db.commit()
 
             # Now, attempt to fetch the email and send the notification
-            email_query = select(RegisteredUsers.email).where(RegisteredUsers.id == chosen_teacher.regUserID)
-            teacher_email = db.execute(email_query).scalar_one_or_none()
+            teacher_email = users.email_by_id(db, chosen_teacher.regUserID)
 
             if teacher_email:
                 # Send the email notification
@@ -372,45 +337,15 @@ def wednesday_job():
     db = SessionLocal()
     try:
         # 1. Find all districts with pending teachers
-        pending_groups = (
-            db.query(
-                cast(NewUsers.state, String),
-                cast(NewUsers.county, String),
-                cast(NewUsers.district, String)
-            )
-            .group_by(
-                cast(NewUsers.state, String),
-                cast(NewUsers.county, String),
-                cast(NewUsers.district, String)
-            )
-            .all()
-        )
+        pending_groups = users.pending_districts(db)
         for state, county, district in pending_groups:
             # 2. Find validated teachers in this district (recipients)
-            recipients = (
-                db.query(RegisteredUsers.email)
-                .join(TeacherList, TeacherList.regUserID == RegisteredUsers.id)
-                .filter(
-                    cast(TeacherList.state, String) == state,
-                    cast(TeacherList.county, String) == county,
-                    cast(TeacherList.district, String) == district
-                )
-                .all()
-            )
-            recipient_emails = [r.email for r in recipients]
+            recipient_emails = users.teacher_emails_in_district(db, state, county, district)
             if not recipient_emails:
                 print(f"No validated teachers found for {district}. Skipping.")
                 continue
             # 3. Get pending teachers in this district
-            pending_teachers = (
-                db.query(NewUsers)
-                .filter(
-                    cast(NewUsers.state, String) == state,
-                    cast(NewUsers.county, String) == county,
-                    cast(NewUsers.district, String) == district
-                )
-                .all()
-            )
+            pending_teachers = users.list_pending_in_district(db, state, county, district)
             if not pending_teachers:
                 continue
             # 4. Build email body
@@ -499,13 +434,11 @@ def send_profile_creation_reminders():
     """
     db = SessionLocal()
     try:
-        # Query for users with createCount equal to 0
-        query = select(RegisteredUsers).where(RegisteredUsers.createCount == 0)
-        users = db.execute(query).scalars().all()
+        recipients = users.without_profile(db)
 
-        if users:
-            print(f"Found {len(users)} users who need a profile reminder.")
-            for user in users:
+        if recipients:
+            print(f"Found {len(recipients)} users who need a profile reminder.")
+            for user in recipients:
                 send_profile_reminder_email(user.email)
             print("Successfully sent all profile creation reminder emails.")
         else:
@@ -561,12 +494,11 @@ def send_validation_reminder_emails():
     """
     db = SessionLocal()
     try:
-        query = select(NewUsers)
-        users = db.execute(query).scalars().all()
+        recipients = users.list_pending(db)
 
-        if users:
-            print(f"Found {len(users)} new users who need a validation reminder.")
-            for user in users:
+        if recipients:
+            print(f"Found {len(recipients)} new users who need a validation reminder.")
+            for user in recipients:
                 send_validation_reminder_email(user.email)
             print("Successfully sent all new user validation reminder emails.")
         else:
@@ -634,22 +566,15 @@ async def register_user(request: Request, name: str = Form(...), email: str = Fo
         raise HTTPException(status_code=400, detail="reCAPTCHA verification failed. Please try again.")
 
     try:
-        query = select(RegisteredUsers.id).where(cast(RegisteredUsers.email, String) == cast(email, String))
-        result = db.execute(query)
-        existing_user = result.fetchone()
-        if existing_user:
+        if users.email_registered(db, email):
             return {"message": "User with this email already exists."}
-        query = select(NewUsers.id).where(cast(NewUsers.email, String) == cast(email, String))
-        result = db.execute(query)
-        existing_user = result.fetchone()
-        if existing_user:
+        if users.email_pending(db, email):
             return {"message": "User with this email is already in the registration queue."}
         if password != confirm_password:
             return {"message": "Password do not match."}
         hashed_password = sha256_crypt.hash(password)
         role = 'teacher'
-        new_user = NewUsers(name=name, email=email, state=state, county=county, district=district, school=school, phone_number=phone_number, password=hashed_password, role=role, report=0, emailed=0)
-        db.add(new_user)
+        users.add_pending(db, name=name, email=email, state=state, county=county, district=district, school=school, phone_number=phone_number, password=hashed_password, role=role, report=0, emailed=0)
         db.commit()
         send_registration_email(email)
         return {"message": "User registered successfully. You should recieve an email shortly. Please check your spam folder"}
@@ -663,17 +588,15 @@ async def register_user(request: Request, name: str = Form(...), email: str = Fo
 @limiter.limit("5/minute")
 async def login_user(request: Request, email: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
     try:
-        query = select(RegisteredUsers).where(cast(RegisteredUsers.email, String) == cast(email, String))
-        result = db.execute(query)
-        user = result.fetchone()
+        user = users.get_by_email(db, email)
         if user:
-            hashed_password = user[0].password
+            hashed_password = user.password
             if sha256_crypt.verify(password, hashed_password):
-                message = "Login successful as " + user[0].role
+                message = "Login successful as " + user.role
                 request.session["user_email"] = email
-                request.session["user_role"] = user[0].role
-                request.session["user_id"] = user[0].id
-                return JSONResponse(content={"message": message, "createCount": user[0].createCount, "role": user[0].role})
+                request.session["user_role"] = user.role
+                request.session["user_id"] = user.id
+                return JSONResponse(content={"message": message, "createCount": user.createCount, "role": user.role})
             else:
                 message = "Invalid login credentials."
         else:
@@ -696,28 +619,24 @@ async def logout_user(request: Request):
 @app.post("/validation/validate_user/{user_email}")
 async def move_user(user_email: str, caller: CurrentUser = Depends(require_member), db: Session = Depends(get_db)):
     try:
-        query = select(NewUsers).where(cast(NewUsers.email, String) == cast(user_email, String))
-        result = db.execute(query)
-        user = result.fetchone()
-        if not user:
+        pending = users.get_pending(db, user_email)
+        if not pending:
             raise HTTPException(status_code=404, detail="User not found in new_users")
 
         # Teachers can only validate users within their own district
         if caller.role == 'teacher':
-            teacher_record = db.execute(select(TeacherList).where(TeacherList.regUserID == caller.id)).fetchone()
+            teacher_record = teachers.get_by_user_id(db, caller.id)
             if not teacher_record or (
-                user[0].state != teacher_record[0].state or
-                user[0].county != teacher_record[0].county or
-                user[0].district != teacher_record[0].district
+                pending.state != teacher_record.state or
+                pending.county != teacher_record.county or
+                pending.district != teacher_record.district
             ):
                 raise HTTPException(status_code=403, detail="You can only validate teachers in your own district.")
-        
-        query = insert(RegisteredUsers).values(email=user[0].email, password=user[0].password, role=user[0].role, phone_number = user[0].phone_number)
-        db.execute(query)
-        delete_query = delete(NewUsers).where(cast(NewUsers.email, String) == cast(user_email, String))
-        db.execute(delete_query)
+
+        email = pending.email
+        users.promote_pending(db, pending)
         db.commit()
-        send_validation_email(user[0].email)        
+        send_validation_email(email)
         return {"message": "User validated."}
     except HTTPException:
         raise
@@ -731,20 +650,19 @@ async def move_user(user_email: str, caller: CurrentUser = Depends(require_membe
 async def create_teacher_profile(request: Request, name: str = Form(...), state: str = Form(...), county: str = Form(...), district: str = Form(...), school: str = Form(...), aboutMe: str = Form(...), wishlist: str = Form(...), user: CurrentUser = Depends(require_member), db: Session = Depends(get_db)):
     id, role = user.id, user.role
     try:
-        query = select(RegisteredUsers.createCount).where(RegisteredUsers.id == id)
-        result = db.execute(query)
-        create_count = result.scalar()
+        create_count = users.create_count(db, id)
         if create_count == 0 or role == 'admin':
             aa_link = wishlist + "&tag=h0mer00mher0-20" 
             email = get_current_email(request)
             first_part_email = email.split('@')[0]
             random_number = secrets.randbelow(9999)
             auto_url_id = f"{first_part_email}{random_number}"
-            while db.execute(select(TeacherList).where(cast(TeacherList.url_id, String) == cast(auto_url_id, String))).first():
+            while teachers.url_id_taken(db, auto_url_id):
                 random_number = secrets.randbelow(9999)
                 auto_url_id = f"{first_part_email}{random_number}"
 
-            insert_query = insert(TeacherList).values(
+            teachers.create(
+                db,
                 name=name,
                 state=state,
                 county=county,
@@ -755,9 +673,7 @@ async def create_teacher_profile(request: Request, name: str = Form(...), state:
                 wishlist_url=aa_link,
                 url_id=auto_url_id
             )
-            db.execute(insert_query)
-            update_query = update(RegisteredUsers).where(RegisteredUsers.id == id).values(createCount=RegisteredUsers.createCount + 1)
-            db.execute(update_query)
+            users.increment_create_count(db, id)
             db.commit()
             return {"message": "Teacher created successfully", "role": role}
         else:
@@ -879,28 +795,20 @@ async def get_teacher_info(request: Request, db: Session = Depends(get_db)):
         district = get_index_cookie('district', request)
         school = get_index_cookie('school', request)
         name = get_index_cookie('teacher', request)
-        query = select(TeacherList).where(
-            (cast(TeacherList.state, String) == state) &
-            (cast(TeacherList.county, String) == county) &
-            (cast(TeacherList.district, String) == district) &
-            (cast(TeacherList.school, String) == school) &
-            (cast(TeacherList.name, String) == name)
-        )
-        result = db.execute(query)
-        teacher_info = result.fetchone()
+        teacher_info = teachers.get_by_location_and_name(db, state, county, district, school, name)
         if teacher_info:
-            if teacher_info[0].image_data:
-                image_data = base64.b64encode(teacher_info[0].image_data).decode('utf-8')
+            if teacher_info.image_data:
+                image_data = base64.b64encode(teacher_info.image_data).decode('utf-8')
             else:
                 image_data = None
             data = {
-                "state": teacher_info[0].state,
-                "county": teacher_info[0].county,
-                "district": teacher_info[0].district,
-                "school": teacher_info[0].school,
-                "name": teacher_info[0].name,
-                "wishlist_url": teacher_info[0].wishlist_url,
-                "about_me": teacher_info[0].about_me,
+                "state": teacher_info.state,
+                "county": teacher_info.county,
+                "district": teacher_info.district,
+                "school": teacher_info.school,
+                "name": teacher_info.name,
+                "wishlist_url": teacher_info.wishlist_url,
+                "about_me": teacher_info.about_me,
                 "image_data": image_data
             }
             return data
@@ -915,8 +823,7 @@ async def get_teacher_info(request: Request, db: Session = Depends(get_db)):
 async def update_info(request: Request, aboutMe: str = Form(...), user: CurrentUser = Depends(require_member), db: Session = Depends(get_db)):
     id = user.id
     try:
-        update_query = update(TeacherList).where(TeacherList.regUserID == id).values(about_me=aboutMe)
-        db.execute(update_query)
+        teachers.update_for_user(db, id, about_me=aboutMe)
         db.commit()
         return {"message": "Info updated."}
     except Exception as e:
@@ -935,13 +842,7 @@ async def update_teacher_school(
 ):
     id = user.id
     try:
-        update_query = update(TeacherList).where(TeacherList.regUserID == id).values(
-            state=state,
-            county=county,
-            district=district,
-            school=school
-        )
-        db.execute(update_query)
+        teachers.update_for_user(db, id, state=state, county=county, district=district, school=school)
         db.commit()
         return JSONResponse(content={"message": "School information updated successfully."})
     except Exception as e:
@@ -954,8 +855,7 @@ async def update_teacher_school(
 async def update_teacher_name(request: Request, teacher: str = Form(...), user: CurrentUser = Depends(require_member), db: Session = Depends(get_db)):
     id = user.id
     try:
-        update_query = update(TeacherList).where(TeacherList.regUserID == id).values(name=teacher)
-        db.execute(update_query)
+        teachers.update_for_user(db, id, name=teacher)
         db.commit()
         return {"message": "Name updated."}
     except Exception as e:
@@ -969,8 +869,7 @@ async def update_wishlist(request: Request, wishlist: str = Form(...), user: Cur
     id = user.id
     try:
         aa_link = wishlist + "&tag=h0mer00mher0-20"
-        update_query = update(TeacherList).where(TeacherList.regUserID == id).values(wishlist_url=aa_link)
-        db.execute(update_query)
+        teachers.update_for_user(db, id, wishlist_url=aa_link)
         db.commit()
         return {"message": "Wishlist updated."}
     except Exception as e:
@@ -985,11 +884,9 @@ async def update_url_id(request: Request, url_id: str = Form(...), user: Current
     try:
         if not re.match(r'^[a-zA-Z0-9_-]{3,50}$', url_id):
             raise HTTPException(status_code=400, detail="URL ID may only contain letters, numbers, hyphens, and underscores (3–50 characters).")
-        existing_teacher = db.query(TeacherList).where(cast(TeacherList.url_id, String) == cast(url_id, String)).first()
-        if existing_teacher:
+        if teachers.url_id_taken(db, url_id):
             raise HTTPException(status_code=409, detail="URL ID already in use.")
-        update_query = update(TeacherList).where(TeacherList.regUserID == id).values(url_id=url_id)
-        db.execute(update_query)
+        teachers.update_for_user(db, id, url_id=url_id)
         db.commit()
         return {"message": "URL ID updated successfully."}
     except HTTPException as e:
@@ -1013,19 +910,18 @@ async def edit_teacher_image(request: Request, image: UploadFile = Form(...), us
         # Validate by actual file signature, not client-supplied content_type
         ALLOWED_MIME_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
         
-        # puremagic equivalent to magic.from_buffer(..., mime=True)
-        results = puremagic.magic_buffer(image_bytes)
-        
-        # Grab the mime type from the first (best) match
-        detected_type = results[0].mime if results else None
+        # puremagic has no magic_buffer; magic_string takes bytes and returns
+        # matches best first (empty or unreadable input raises PureError/ValueError).
+        try:
+            results = puremagic.magic_string(image_bytes)
+        except (puremagic.PureError, ValueError):
+            results = []
+        detected_type = results[0].mime_type if results else None
 
         if detected_type not in ALLOWED_MIME_TYPES:
             raise HTTPException(status_code=400, detail="Invalid file type. Only JPEG, PNG, GIF, and WebP are allowed.")
         
-        update_query = update(TeacherList).values(image_data=image_bytes).where(
-            TeacherList.regUserID == id
-        )
-        db.execute(update_query)
+        teachers.update_for_user(db, id, image_data=image_bytes)
         db.commit()
         return {"message": "Information updated."}
     except HTTPException as he:
@@ -1039,15 +935,13 @@ async def edit_teacher_image(request: Request, image: UploadFile = Form(...), us
 @app.get("/profile/myinfo/")
 async def get_myinfo(request: Request, id: int = Depends(get_current_id), db: Session = Depends(get_db)):
     try:
-        query = select(TeacherList).where(TeacherList.regUserID == id)
-        result = db.execute(query)
-        teacher_data = result.fetchone()
+        teacher_data = teachers.get_by_user_id(db, id)
         if teacher_data:
-            state = teacher_data[0].state
-            county = teacher_data[0].county
-            district = teacher_data[0].district
-            school = teacher_data[0].school
-            name = teacher_data[0].name
+            state = teacher_data.state
+            county = teacher_data.county
+            district = teacher_data.district
+            school = teacher_data.school
+            name = teacher_data.name
             request.session["state"] = state
             request.session["county"] = county
             request.session["district"] = district
@@ -1066,13 +960,10 @@ async def get_myinfo(request: Request, id: int = Depends(get_current_id), db: Se
 async def update_password(request: Request, id: int = Depends(get_current_id), old_password: str = Form(...), new_password: str = Form(...), new_password_confirmed: str = Form(...), db: Session = Depends(get_db)):
     try:
         if new_password == new_password_confirmed:
-            query = select(RegisteredUsers.password).where(RegisteredUsers.id == id)
-            result = db.execute(query)
-            old_pass = result.scalar()
+            old_pass = users.password_hash(db, id)
             if old_pass and sha256_crypt.verify(old_password, old_pass):
                 hashed_new_password = sha256_crypt.hash(new_password)
-                update_query = update(RegisteredUsers).where(RegisteredUsers.id == id).values(password=hashed_new_password)
-                db.execute(update_query)
+                users.set_password_by_id(db, id, hashed_new_password)
                 db.commit()
                 return {"status": "success", "message": "Password updated successfully"}
             else:
@@ -1093,16 +984,8 @@ async def check_access_teacher(request: Request, user: CurrentUser = Depends(req
         district = get_index_cookie('district', request)
         school = get_index_cookie('school', request)
         name = get_index_cookie('teacher', request)
-        query = select(TeacherList.regUserID).where(
-            (cast(TeacherList.state, String) == state) &
-            (cast(TeacherList.county, String) == county) &
-            (cast(TeacherList.district, String) == district) &
-            (cast(TeacherList.school, String) == school) &
-            (cast(TeacherList.name, String) == name)
-        )
-        result = db.execute(query)
-        teacher_data = result.scalar()
-        if teacher_data == user.id:
+        teacher = teachers.get_by_location_and_name(db, state, county, district, school, name)
+        if teacher is not None and teacher.regUserID == user.id:
             return {"status": "success", "message": "Access granted"}
         raise HTTPException(status_code=403, detail="No access")
     except HTTPException:
@@ -1112,29 +995,26 @@ async def check_access_teacher(request: Request, user: CurrentUser = Depends(req
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
 
+def _pending_dict(u) -> dict:
+    return {"name": u.name, "email": u.email, "state": u.state, "district": u.district, "school": u.school,
+            "phone_number": u.phone_number, "report": u.report, "emailed": u.emailed}
+
+
 #gets a list of unverified users to validate based on the role of the user
 @app.get("/api/validation_list/")
 async def validation_page(request: Request, caller: CurrentUser = Depends(require_member), db: Session = Depends(get_db)):
     role, id = caller.role, caller.id
     try:
         if role == "admin":
-            query = select(NewUsers)
-            result = db.execute(query)
-            new_users = result.fetchall()
-            return {"new_users": [{"name": user[0].name, "email": user[0].email, "state": user[0].state, "district": user[0].district, "school": user[0].school, "phone_number": user[0].phone_number, "report": user[0].report, "emailed": user[0].emailed} for user in new_users], "role": role}
+            new_users = users.list_pending(db)
+            return {"new_users": [_pending_dict(u) for u in new_users], "role": role}
         if role == 'teacher':
             store_my_cookies(request, id, db)
             state = get_index_cookie('state', request)
             county = get_index_cookie('county', request)
             district = get_index_cookie('district', request)
-            query = select(NewUsers).where(
-                (cast(NewUsers.state, String) == state) &
-                (cast(NewUsers.county, String) == county) &
-                (cast(NewUsers.district, String) == district)
-            )
-            result = db.execute(query)
-            new_users = result.fetchall()
-            return {"new_users": [{"name": user[0].name, "email": user[0].email, "state": user[0].state, "district": user[0].district, "school": user[0].school, "phone_number": user[0].phone_number, "report": user[0].report, "emailed": user[0].emailed} for user in new_users], "role": role}
+            new_users = users.list_pending_in_district(db, state, county, district)
+            return {"new_users": [_pending_dict(u) for u in new_users], "role": role}
     except Exception as e:
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")          
@@ -1143,42 +1023,32 @@ async def validation_page(request: Request, caller: CurrentUser = Depends(requir
 #api gets a list of states from statecoutny table
 @app.get("/api/get_states/")
 async def get_states(db: Session = Depends(get_db)):
-    states = db.query(School.state).distinct().all()
-    return sorted([state[0] for state in states])
+    return sorted(schools.list_states(db))
 
 #api gets the names of the counties in the desired state
 @app.get("/api/get_counties/{state}")
 async def get_counties(state: str, db: Session = Depends(get_db)):
-    query = select(School.county).distinct().where(School.state == state)
-    result = db.execute(query)
-    counties = result.fetchall()
+    counties = schools.list_counties(db, state)
     if counties:
-        county_names = sorted([county[0] for county in counties])
-        return county_names
+        return sorted(counties)
     else:
         return {"message": f"No counties found for state: {state}"}
 
 #api gets the names of the school districts in the desired county and state
 @app.get("/api/get_districts/{state}/{county}")
 async def get_districts(state: str, county: str, db: Session = Depends(get_db)):
-    query = select(School.district).distinct().where((School.state == state) & (School.county == county))
-    result = db.execute(query)
-    districts = result.fetchall()
+    districts = schools.list_districts(db, state, county)
     if districts:
-        district_names = sorted([district[0] for district in districts])
-        return district_names
+        return sorted(districts)
     else:
         return {"message": f"No districts found for state: {state} and county: {county}"}
 
 #api gets the names of the school in the desired district, coutny, and state
 @app.get("/api/get_schools/{state}/{county}/{district}")
 async def get_schools(state: str, county: str, district: str, db: Session = Depends(get_db)):
-    query = select(School.school_name).distinct().where((School.state == state) & (School.county == county) & (School.district == district))
-    result = db.execute(query)
-    schools = result.fetchall()
-    if schools:
-        school_names = sorted([school[0] for school in schools])
-        return school_names
+    school_names = schools.list_schools(db, state, county, district)
+    if school_names:
+        return sorted(school_names)
     else:
         return {"message": f"No schools found for state: {state}, county: {county}, and district: {district}"}
 
@@ -1186,16 +1056,12 @@ async def get_schools(state: str, county: str, district: str, db: Session = Depe
 @limiter.limit("5/minute")
 async def forgot_password(request: Request, email: str = Form(...), db: Session = Depends(get_db)):
     try:
-        query = select(RegisteredUsers.id).where(cast(RegisteredUsers.email, String) == cast(email, String))
-        result = db.execute(query)
-        user = result.fetchone()
-        if user:
+        if users.email_registered(db, email):
             # Generate a secure token
             token = secrets.token_urlsafe(32)
             expires_at = datetime.datetime.utcnow() + datetime.timedelta(hours=1)
             # Store the token
-            reset_token = PasswordResetToken(email=email, token=token, expires_at=expires_at)
-            db.add(reset_token)
+            users.add_reset_token(db, email, token, expires_at)
             db.commit()
             # Send email with link instead of temp password
             reset_link = f"{settings.base_url}/pages/reset_password.html?token={token}"
@@ -1225,18 +1091,12 @@ async def reset_password(token: str = Form(...), new_password: str = Form(...), 
         if new_password != confirm_password:
             raise HTTPException(status_code=400, detail="Passwords do not match.")
         # Look up the token
-        reset = db.query(PasswordResetToken).filter(
-            PasswordResetToken.token == token,
-            PasswordResetToken.used == 0,
-            PasswordResetToken.expires_at > datetime.datetime.utcnow()
-        ).first()
+        reset = users.get_usable_reset_token(db, token, datetime.datetime.utcnow())
         if not reset:
             raise HTTPException(status_code=400, detail="Invalid or expired reset token.")
         # Update the password
         hashed = sha256_crypt.hash(new_password)
-        db.execute(update(RegisteredUsers).where(
-            cast(RegisteredUsers.email, String) == cast(reset.email, String)
-        ).values(password=hashed))
+        users.set_password_by_email(db, reset.email, hashed)
         # Mark token as used
         reset.used = 1
         db.commit()
@@ -1252,16 +1112,8 @@ async def reset_password(token: str = Form(...), new_password: str = Form(...), 
 @app.get("/api/teacher_of_the_day")
 async def get_teacher_of_the_day(request: Request, db: Session = Depends(get_db)):
     try:
-        query = (
-            select(TeacherList)
-            .where(TeacherList.last_TOD.isnot(None))
-            .order_by(desc(TeacherList.last_TOD))
-            .limit(1)
-        )
-        result = db.execute(query)
-        row = result.fetchone()
-        if row:
-            data = row[0]
+        data = teachers.latest_teacher_of_the_day(db)
+        if data:
             if data.image_data:
                 image_data = base64.b64encode(data.image_data).decode('utf-8')
             else:
@@ -1300,18 +1152,10 @@ async def get_teacher_url(request: Request, db: Session = Depends(get_db)):
         district = get_index_cookie('district', request)
         school = get_index_cookie('school', request)
         name = get_index_cookie('teacher', request)
-        query = select(TeacherList.url_id).where(
-            (cast(TeacherList.state, String) == state) &
-            (cast(TeacherList.county, String) == county) &
-            (cast(TeacherList.district, String) == district) &
-            (cast(TeacherList.school, String) == school) &
-            (cast(TeacherList.name, String) == name)
-        )
-        result = db.execute(query)
-        token = result.fetchone()
-        if not token:
+        teacher = teachers.get_by_location_and_name(db, state, county, district, school, name)
+        if not teacher:
             raise HTTPException(status_code=404, detail="No matching teacher found")
-        url = f"{settings.display_host}/teacher/" + token[0]
+        url = f"{settings.display_host}/teacher/" + teacher.url_id
         return {"url": url}  # Return as JSON
     except Exception as e:
         logger.error(f"Internal Server Error: {str(e)}") 
@@ -1321,16 +1165,14 @@ async def get_teacher_url(request: Request, db: Session = Depends(get_db)):
 @app.get("/teacher/{url_id}")
 async def get_teacher_info(url_id: str, request: Request, db: Session = Depends(get_db)):
     try:
-        query = select(TeacherList).where(cast(TeacherList.url_id, String) == url_id)
-        result = db.execute(query)
-        teacher_info = result.fetchone()
+        teacher_info = teachers.get_by_url_id(db, url_id)
         if not teacher_info:
             return RedirectResponse(url="/pages/404.html")
-        request.session['state'] = teacher_info[0].state
-        request.session['county'] = teacher_info[0].county
-        request.session['district'] = teacher_info[0].district
-        request.session['school'] = teacher_info[0].school
-        request.session['teacher'] = teacher_info[0].name
+        request.session['state'] = teacher_info.state
+        request.session['county'] = teacher_info.county
+        request.session['district'] = teacher_info.district
+        request.session['school'] = teacher_info.school
+        request.session['teacher'] = teacher_info.name
 
         return RedirectResponse(url="/pages/teacher.html")
     except Exception as e:
@@ -1340,13 +1182,9 @@ async def get_teacher_info(url_id: str, request: Request, db: Session = Depends(
 @app.post("/validation/delete_user/{user_email}")
 async def delete_user(user_email: str, caller: CurrentUser = Depends(require_admin), db: Session = Depends(get_db)):
     try:
-        query = select(NewUsers).where(cast(NewUsers.email, String) == cast(user_email, String))
-        result = db.execute(query)
-        user = result.fetchone()
-        if not user:
+        if not users.email_pending(db, user_email):
             raise HTTPException(status_code=404, detail="User not found in new_users")
-        delete_query = delete(NewUsers).where(cast(NewUsers.email, String) == cast(user_email, String))
-        db.execute(delete_query)
+        users.delete_pending(db, user_email)
         db.commit()
         return {"message": "User deleted successfully."}
     except Exception as e:
@@ -1358,8 +1196,7 @@ async def delete_user(user_email: str, caller: CurrentUser = Depends(require_adm
 @app.post("/validation/report_user/{user_email}")
 async def report_user(user_email: str, user: CurrentUser = Depends(require_member), db: Session = Depends(get_db)):
     try:
-        update_query = update(NewUsers).where(cast(NewUsers.email, String) == cast(user_email, String)).values(report=1)
-        db.execute(update_query)
+        users.flag_pending(db, user_email, report=1)
         db.commit()
         return {"message": "User reported."}
     except Exception as e:
@@ -1371,8 +1208,7 @@ async def report_user(user_email: str, user: CurrentUser = Depends(require_membe
 @app.post("/validation/emailed_user/{user_email}")
 async def emailed_user(user_email: str, user: CurrentUser = Depends(require_member), db: Session = Depends(get_db)):
     try:
-        update_query = update(NewUsers).where(cast(NewUsers.email, String) == cast(user_email, String)).values(emailed=1)
-        db.execute(update_query)
+        users.flag_pending(db, user_email, emailed=1)
         db.commit()
         return {"message": "User emailed."}
     except Exception as e:
@@ -1384,64 +1220,42 @@ async def emailed_user(user_email: str, user: CurrentUser = Depends(require_memb
 #api gets a list of states from statecoutny table
 @app.get("/api/index_states/")
 async def index_states(db: Session = Depends(get_db)):
-    states = db.query(cast(TeacherList.state, String)).distinct().all()
-    return sorted([state[0] for state in states])
+    return sorted(teachers.index_states(db))
 
 #api gets the names of the counties in the desired state
 @app.get("/api/index_counties/{state}")
 async def index_counties(state: str, db: Session = Depends(get_db)):
-    query = select(cast(TeacherList.county, String)).distinct().where(cast(TeacherList.state, String) == state)
-    result = db.execute(query)
-    counties = result.fetchall()
+    counties = teachers.index_counties(db, state)
     if counties:
-        county_names = sorted([county[0] for county in counties])
-        return county_names
+        return sorted(counties)
     else:
         return {"message": f"No counties found for state: {state}"}
 
 #api gets the names of the school districts in the desired county and state
 @app.get("/api/index_districts/{state}/{county}")
 async def index_districts(state: str, county: str, db: Session = Depends(get_db)):
-    query = select(cast(TeacherList.district, String)).distinct().where((cast(TeacherList.state, String) == state) & (cast(TeacherList.county, String) == county))
-    result = db.execute(query)
-    districts = result.fetchall()
+    districts = teachers.index_districts(db, state, county)
     if districts:
-        district_names = sorted([district[0] for district in districts])
-        return district_names
+        return sorted(districts)
     else:
         return {"message": f"No districts found for state: {state} and county: {county}"}
 
 #api gets the names of the school in the desired district, coutny, and state
 @app.get("/api/index_schools/{state}/{county}/{district}")
 async def index_schools(state: str, county: str, district: str, db: Session = Depends(get_db)):
-    query = select(cast(TeacherList.school, String)).distinct().where((cast(TeacherList.state, String) == state) & (cast(TeacherList.county, String) == county) & (cast(TeacherList.district, String) == district))       
-    result = db.execute(query)
-    schools = result.fetchall()
-    if schools:
-        school_names = sorted([school[0] for school in schools])
-        return school_names
+    school_names = teachers.index_schools(db, state, county, district)
+    if school_names:
+        return sorted(school_names)
     else:
         return {"message": f"No schools found for state: {state}, county: {county}, and district: {district}"}
 
 ###api gets the teachers and their url_id for the index
 @app.post("/api/index_teachers/")
 async def index_teachers(state: str = Form(...),county: str = Form(None),district: str = Form(None),school: str = Form(None), db: Session = Depends(get_db)):
-    query = select(TeacherList.name, TeacherList.url_id).where(
-        (cast(TeacherList.state, String) == state)
-    )
+    matches = teachers.search(db, state, county, district, school)
 
-    if county:
-        query = query.where(cast(TeacherList.county, String) == county)
-    if district:
-        query = query.where(cast(TeacherList.district, String) == district)
-    if school:
-        query = query.where(cast(TeacherList.school, String) == school)
-
-    result = db.execute(query)
-    teachers = result.fetchall()
-
-    if teachers:
-        return [{"name": teacher.name, "url_id": teacher.url_id} for teacher in teachers]
+    if matches:
+        return [{"name": teacher.name, "url_id": teacher.url_id} for teacher in matches]
     else:
         raise HTTPException(
             status_code=404,
@@ -1452,35 +1266,20 @@ async def index_teachers(state: str = Form(...),county: str = Form(None),distric
 async def generate_teacher_report(state: str = Form(...), county: str = Form(None), district: str = Form(None), school: str = Form(None), caller: CurrentUser = Depends(require_admin), db: Session = Depends(get_db)):
     try:
         # Step 1: Dynamically filter TeacherList based on provided fields (excluding regUserID)
-        query = select(
-            TeacherList.name, TeacherList.school, TeacherList.regUserID
-        ).where(cast(TeacherList.state, String) == state)
+        report_teachers = teachers.report_rows(db, state, county, district, school)
 
-        if county:
-            query = query.where(cast(TeacherList.county, String) == county)
-        if district:
-            query = query.where(cast(TeacherList.district, String) == district)
-        if school:
-            query = query.where(cast(TeacherList.school, String) == school)
-
-        teachers = db.execute(query).fetchall()
-
-        if not teachers:
+        if not report_teachers:
             raise HTTPException(status_code=404, detail="No teachers found with the specified criteria.")
 
         # Step 2: Fetch email and phone from RegisteredUsers using regUserID
-        reg_user_ids = [teacher.regUserID for teacher in teachers]
-        user_query = select(
-            RegisteredUsers.id,
-            RegisteredUsers.email,
-            RegisteredUsers.phone_number).where(RegisteredUsers.id.in_(reg_user_ids))
-        users = db.execute(user_query).fetchall()
+        reg_user_ids = [teacher.regUserID for teacher in report_teachers]
+        contacts = users.contacts_by_id(db, reg_user_ids)
 
         # Step 3: Map teachers to their corresponding user data (email and phone)
-        user_dict = {user.id: {"email": user.email, "phone": user.phone_number} for user in users}
+        user_dict = {c.id: {"email": c.email, "phone": c.phone_number} for c in contacts}
 
         table_data = [["Name", "School", "Email", "Phone"]]
-        for teacher in teachers:
+        for teacher in report_teachers:
             table_data.append([
                 teacher.name or "",
                 teacher.school or "",
@@ -1580,7 +1379,7 @@ def create_post(request: Request, title: str = Form(...), content: str = Form(..
     )
     try:
         # 2. Add to session and commit
-        db.add(new_post)
+        forum.add(db, new_post)
         db.commit()
         # 3. Refresh to get the auto-generated ID and created_at timestamp
         db.refresh(new_post)
@@ -1609,7 +1408,7 @@ def get_posts(db: Session = Depends(get_db)):
     try:
         # Query all posts and order them by the 'created_at' column descending.
         # This returns the newest posts first, which is a good default for a feed.
-        posts = db.query(ForumPost).order_by(ForumPost.created_at.desc()).all()
+        posts = forum.list_posts(db)
         return posts
     except Exception as e:
         print(f"Database error during post retrieval: {e}")
@@ -1628,7 +1427,7 @@ def get_post(post_id: int, db: Session = Depends(get_db)):
     
     try:
         # Query the database for a single post matching the provided ID
-        post = db.query(ForumPost).filter(ForumPost.id == post_id).first()
+        post = forum.get_post(db, post_id)
         
         # Check if the post was found
         if post is None:
@@ -1663,21 +1462,18 @@ def handle_post_vote(post_id: int, vote_data: VoteInput, user: CurrentUser = Dep
         )
 
     # 2. Check if the post exists
-    post = db.query(ForumPost).filter(ForumPost.id == post_id).first()
+    post = forum.get_post(db, post_id)
     if not post:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Post with ID {post_id} not found.")
 
     # 3. Check for an existing vote by this user
-    existing_vote = db.query(PostVote).filter(
-        PostVote.post_id == post_id,
-        PostVote.user_id == user_id
-    ).first()
+    existing_vote = forum.get_vote(db, post_id, user_id)
 
     try:
         if existing_vote:
             if existing_vote.vote_type == vote_type:
                 # Case 1: Retract vote (User clicks the same button again)
-                db.delete(existing_vote)
+                forum.remove(db, existing_vote)
                 # Subtract the existing vote type from the post's count
                 post.upvote_count -= vote_type
                 
@@ -1696,7 +1492,7 @@ def handle_post_vote(post_id: int, vote_data: VoteInput, user: CurrentUser = Dep
         else:
             # Case 3: New vote
             new_vote = PostVote(post_id=post_id, user_id=user_id, vote_type=vote_type)
-            db.add(new_vote)
+            forum.add(db, new_vote)
             # Add the new vote type to the post's cached count
             post.upvote_count += vote_type
 
@@ -1721,7 +1517,7 @@ def add_comment_to_post(request: Request, post_id: int, content: str = Form(...)
     user_id = user.id
 
     # 1. Check if the parent post exists
-    post = db.query(ForumPost).filter(ForumPost.id == post_id).first()
+    post = forum.get_post(db, post_id)
     if not post:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, 
@@ -1730,7 +1526,7 @@ def add_comment_to_post(request: Request, post_id: int, content: str = Form(...)
 
     # 2. Check if a parent comment exists (if parent_comment_id is provided, for nesting)
     if parent_comment_id:
-        parent_comment = db.query(ForumComment).filter(ForumComment.id == parent_comment_id).first()
+        parent_comment = forum.get_comment(db, parent_comment_id)
         if not parent_comment:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, 
@@ -1746,7 +1542,7 @@ def add_comment_to_post(request: Request, post_id: int, content: str = Form(...)
             parent_comment_id=parent_comment_id
         )
         # 4. Add to session
-        db.add(new_comment)
+        forum.add(db, new_comment)
         
         # 5. Update the comment_count on the parent post (Denormalization)
         post.comment_count += 1 
@@ -1774,7 +1570,7 @@ def get_comments_for_post(post_id: int = Path(..., gt=0), db: Session = Depends(
     """
     
     # 1. Check if the parent post exists (Optional, but good practice)
-    post = db.query(ForumPost).filter(ForumPost.id == post_id).first()
+    post = forum.get_post(db, post_id)
     if not post:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, 
@@ -1783,10 +1579,7 @@ def get_comments_for_post(post_id: int = Path(..., gt=0), db: Session = Depends(
 
     try:
         # 2. Query all comments for that post ID
-        comments = db.query(ForumComment)\
-                     .filter(ForumComment.post_id == post_id)\
-                     .order_by(desc(ForumComment.created_at))\
-                     .all()
+        comments = forum.list_comments(db, post_id)
 
         # 3. FIX APPLIED HERE: Convert list of SQLAlchemy model objects to list of dictionaries
         return [model_to_dict(comment) for comment in comments] 
@@ -1803,12 +1596,12 @@ def delete_post(post_id: int, user: CurrentUser = Depends(require_admin), db: Se
     Deletes a post. Only allowed for role = 'admin'.
     """
     # 2. Find the post
-    post = db.query(ForumPost).filter(ForumPost.id == post_id).first()
+    post = forum.get_post(db, post_id)
     if not post:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Post not found")
 
     # 3. Delete the post
-    db.delete(post)
+    forum.remove(db, post)
     db.commit()
     
     # Due to CASCADE ON DELETE in the schema, votes and comments are automatically deleted.
@@ -1820,7 +1613,7 @@ def delete_comment(comment_id: int, user: CurrentUser = Depends(require_admin), 
     Deletes a comment. Only allowed for admin OR the comment's author (not yet but can be if you uncomment below)
     """
     # 1. Find the comment
-    comment = db.query(ForumComment).filter(ForumComment.id == comment_id).first()
+    comment = forum.get_comment(db, comment_id)
     
     if not comment:
         raise HTTPException(
@@ -1832,15 +1625,15 @@ def delete_comment(comment_id: int, user: CurrentUser = Depends(require_admin), 
     # dependency to require_login and check comment.user_id == user.id.
 
     # 3. Denormalization: Decrement the parent post's comment count
-    post = db.query(ForumPost).filter(ForumPost.id == comment.post_id).first()
+    post = forum.get_post(db, comment.post_id)
     
     if post and post.comment_count > 0:
         post.comment_count -= 1
-        # No need for db.add(post) if using SQLAlchemy and it's tracked by the session, 
+        # No need to add the post again: the session tracks it,
         # but calling db.commit() below will save the change.
     
     # 4. Delete the comment
-    db.delete(comment)
+    forum.remove(db, comment)
     db.commit()
     
     # Note on nested comments: If you need to handle deletion of child comments 
@@ -1858,7 +1651,7 @@ async def update_post(post_id: int, post_data: PostUpdate, id: int = Depends(get
     
     try:
         # 1. Fetch the existing post
-        existing_post = db.query(ForumPost).filter(ForumPost.id == post_id).first()
+        existing_post = forum.get_post(db, post_id)
         
         if existing_post is None:
             raise HTTPException(status_code=404, detail=f"Post with ID {post_id} not found.")
@@ -1902,7 +1695,7 @@ async def update_comment(comment_id: int, content: str = Form(...), user: int = 
     
     try:
         # 1. Fetch the existing comment
-        existing_comment = db.query(ForumComment).filter(ForumComment.id == comment_id).first()
+        existing_comment = forum.get_comment(db, comment_id)
         
         if existing_comment is None:
             raise HTTPException(status_code=404, detail=f"Comment with ID {comment_id} not found.")
@@ -1950,29 +1743,14 @@ async def admin_delete_user_account(target_email: str = Form(...), admin_secret_
     try:
         # 3. FIND THE TARGET USER ID
         # Select the ID of the user to be deleted based on the target email.
-        user_id_query = select(RegisteredUsers.id).where(
-            cast(RegisteredUsers.email, String) == cast(target_email, String)
-        )
-        user_id_result = db.execute(user_id_query).fetchone()
+        target = users.get_by_email(db, target_email)
 
-        if not user_id_result:
+        if not target:
             raise HTTPException(status_code=404, detail=f"User account linked to '{target_email}' not found.")
 
-        target_user_id = user_id_result[0]
-
-        # 4. DELETE FROM teacher_list
-        # Delete the entry in the teacher_list linked to this user ID (regUserID).
-        delete_teacher_query = delete(TeacherList).where(
-            TeacherList.regUserID == target_user_id
-        )
-        teacher_result = db.execute(delete_teacher_query)
-
-        # 5. DELETE FROM registered_users
-        # Delete the user account itself using the email.
-        delete_user_query = delete(RegisteredUsers).where(
-            cast(RegisteredUsers.email, String) == cast(target_email, String)
-        )
-        user_result = db.execute(delete_user_query)
+        # 4. Delete their teacher page, then the account itself.
+        teachers.delete_for_user(db, target.id)
+        users.delete_by_email(db, target_email)
         db.commit()
         return {"message": f"Successfully deleted account and associated data for target user: {target_email}."}
 
@@ -2014,24 +1792,12 @@ async def create_admin_account(
 
     try:
         # 4. Make sure this email isn't already in use, in either table
-        existing_registered = db.execute(
-            select(RegisteredUsers.id).where(cast(RegisteredUsers.email, String) == cast(email, String))
-        ).fetchone()
-        existing_pending = db.execute(
-            select(NewUsers.id).where(cast(NewUsers.email, String) == cast(email, String))
-        ).fetchone()
-        if existing_registered or existing_pending:
+        if users.email_registered(db, email) or users.email_pending(db, email):
             raise HTTPException(status_code=400, detail="An account with this email already exists.")
 
         # 5. Create the admin account directly in registered_users (id auto-assigned by the DB)
         hashed_password = sha256_crypt.hash(password)
-        new_admin = RegisteredUsers(
-            email=email,
-            password=hashed_password,
-            role='admin',
-            createCount=0
-        )
-        db.add(new_admin)
+        users.create_admin(db, email, hashed_password)
         db.commit()
         return {"message": f"Admin account created successfully for {email}."}
 
