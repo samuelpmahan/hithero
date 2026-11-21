@@ -117,7 +117,9 @@ def test_password_reset_email(outbox, monkeypatch):
         check_golden("password_reset", outbox.sent)
     finally:
         # Leave the seeded database as it was for other tests.
+        from models import PasswordResetToken
+
         db = app.SessionLocal()
-        db.query(app.PasswordResetToken).filter(app.PasswordResetToken.token == FIXED_TOKEN).delete()
+        db.query(PasswordResetToken).filter(PasswordResetToken.token == FIXED_TOKEN).delete()
         db.commit()
         db.close()

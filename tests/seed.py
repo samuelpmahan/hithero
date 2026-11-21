@@ -70,18 +70,19 @@ def seed() -> None:
     import sqlalchemy
 
     import app as app_module
-    from app import (
+    from models import (
         ForumComment,
         ForumPost,
         NewUsers,
+        PasswordResetToken,
         PostVote,
         RegisteredUsers,
         School,
         TeacherList,
     )
 
-    app_module.PasswordResetToken.__table__.c.token.type = sqlalchemy.String(255)
-    app_module.RegisteredUsers.__table__.c.createCount.server_default = sqlalchemy.DefaultClause("0")
+    PasswordResetToken.__table__.c.token.type = sqlalchemy.String(255)
+    RegisteredUsers.__table__.c.createCount.server_default = sqlalchemy.DefaultClause("0")
     app_module.engine.dispose()  # drop connections to the old database
     testenv.real_create_all(app_module.Base.metadata, bind=app_module.engine)
 
