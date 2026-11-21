@@ -42,6 +42,22 @@ def random_teacher(db: Session) -> TeacherList | None:
     return db.execute(select(TeacherList).order_by(func.newid()).limit(1)).scalar_one_or_none()
 
 
+def pick_teacher_of_the_day(db: Session, cutoff: datetime.datetime) -> TeacherList | None:
+    """A random teacher not featured since cutoff (or never featured).
+
+    If everyone was featured since cutoff, the one featured longest ago.
+    None only when there are no teachers at all.
+    """
+    eligible = select(TeacherList).where(
+        (TeacherList.last_TOD.is_(None)) | (TeacherList.last_TOD < cutoff)
+    ).order_by(func.newid()).limit(1)
+    teacher = db.execute(eligible).scalar_one_or_none()
+    if teacher is None:
+        oldest = select(TeacherList).order_by(TeacherList.last_TOD).limit(1)
+        teacher = db.execute(oldest).scalar_one_or_none()
+    return teacher
+
+
 def latest_teacher_of_the_day(db: Session) -> TeacherList | None:
     query = (
         select(TeacherList)

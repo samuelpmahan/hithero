@@ -418,3 +418,25 @@ def test_login_upgrades_legacy_password_hash(fresh_db):
     assert login(helpers.client(), "bob@example.com").json()["message"] == "Login successful as teacher"
     assert stored_hash() == upgraded
     assert login(helpers.client(), "bob@example.com", "wrong").json() == {"message": "Invalid login credentials."}
+
+
+def test_teacher_of_the_day_when_everyone_was_featured_recently(fresh_db):
+    """BE4-4: the old picker looped forever once every teacher had been
+    featured within 90 days. Now it takes whoever was featured longest ago."""
+    import datetime
+
+    import app
+    import jobs
+
+    now = datetime.datetime.utcnow()
+    with app.SessionLocal() as db:
+        for i, teacher in enumerate(db.query(TeacherList).order_by(TeacherList.id)):
+            teacher.last_TOD = now - datetime.timedelta(days=1, hours=i)
+        db.commit()
+        oldest = db.query(TeacherList).order_by(TeacherList.last_TOD).first().url_id
+        picked = jobs.fetch_teacher_for_tod(db)
+    assert picked is not None and picked.url_id == oldest
+
+    outbox = fresh_db
+    jobs.daily_job()
+    assert len(outbox.sent) == 1
