@@ -4,3 +4,6 @@
 .idea
 sql_query/
 .vscode/
+__pycache__/
+.pytest_cache/
+venv/
