@@ -910,11 +910,13 @@ async def edit_teacher_image(request: Request, image: UploadFile = Form(...), us
         # Validate by actual file signature, not client-supplied content_type
         ALLOWED_MIME_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
         
-        # puremagic equivalent to magic.from_buffer(..., mime=True)
-        results = puremagic.magic_buffer(image_bytes)
-        
-        # Grab the mime type from the first (best) match
-        detected_type = results[0].mime if results else None
+        # puremagic has no magic_buffer; magic_string takes bytes and returns
+        # matches best first (empty or unreadable input raises PureError/ValueError).
+        try:
+            results = puremagic.magic_string(image_bytes)
+        except (puremagic.PureError, ValueError):
+            results = []
+        detected_type = results[0].mime_type if results else None
 
         if detected_type not in ALLOWED_MIME_TYPES:
             raise HTTPException(status_code=400, detail="Invalid file type. Only JPEG, PNG, GIF, and WebP are allowed.")
