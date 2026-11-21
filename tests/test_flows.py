@@ -230,3 +230,20 @@ def test_delete_post_with_comments(fresh_db):
     login(admin, "admin@example.com")
     with pytest.raises(Exception, match="REFERENCE constraint"):
         admin.delete("/forum/post/1/delete")
+
+
+def test_daily_teacher_of_the_day_job(fresh_db):
+    """Daily job: picks a teacher, stamps last_TOD, emails them, and the
+    homepage's teacher of the day becomes that teacher."""
+    import app
+
+    outbox = fresh_db
+    app.daily_job()
+    assert len(outbox.sent) == 1
+    message = outbox.sent[0]
+    assert message["content"]["subject"] == "🎉 You're Today's Homeroom Hero!"
+    recipient = message["recipients"]["to"][0]["address"]
+    assert recipient in {"alice@example.com", "bob@example.com", "carol@example.com"}
+
+    featured = helpers.client().get("/api/teacher_of_the_day").json()
+    assert featured["url_id"] in message["content"]["plainText"]

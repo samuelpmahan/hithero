@@ -3,6 +3,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, File
 from pydantic import BaseModel, Field
 import os, logging, smtplib, secrets, string, pyodbc, time, ssl, datetime, base64, requests, threading
 from config import settings
+from db import SessionLocal, engine, get_db
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.applications import Starlette
@@ -83,10 +84,6 @@ CRONJOB_ALLOWED_IPS = {
 }
 
 
-# Construct SQLAlchemy database URL
-SQLALCHEMY_DATABASE_URL = f"mssql+pyodbc://{settings.database_uid}:{settings.database_password}@{settings.database_server}:{settings.database_port}/{settings.database_name}?driver=ODBC+Driver+18+for+SQL+Server"
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 # Maximum allowed file size in bytes (e.g., 1MB)
@@ -244,8 +241,7 @@ def get_current_email(request: Request):
 def get_index_cookie(index: str, request: Request):
     return request.session.get(index, None)
 
-def store_my_cookies(request: Request, id: int = Depends(get_current_id)):
-    db = SessionLocal()
+def store_my_cookies(request: Request, id: int, db: Session):
     try:
         query = select(TeacherList).where(TeacherList.regUserID == id)
         result = db.execute(query)
@@ -262,8 +258,6 @@ def store_my_cookies(request: Request, id: int = Depends(get_current_id)):
     except Exception as e:
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")
-    finally:
-        db.close()
 
 def render_email_template(template_path: str, data: dict) -> str:
     """
@@ -386,8 +380,7 @@ def update_temp_password(db: Session, email: str, new_password: str):
         raise
 
 # Function to fetch a random teacher from the database
-def fetch_random_teacher():
-    db = SessionLocal()
+def fetch_random_teacher(db: Session):
     try:
         # The scalar_one_or_none() method directly returns the TeacherList object,
         # or None if no teacher is found.
@@ -397,10 +390,8 @@ def fetch_random_teacher():
     except Exception as e:
         print(f"Error fetching random teacher: {e}")
         return None
-    finally:
-        db.close()
 
-def fetch_teacher_for_tod():
+def fetch_teacher_for_tod(db: Session):
     """
     Picks the next Teacher of the Day.
 
@@ -412,7 +403,7 @@ def fetch_teacher_for_tod():
     """
     cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=90)
     while True:
-        candidate = fetch_random_teacher()
+        candidate = fetch_random_teacher(db)
         if candidate is None:
             # No teachers at all in teacher_list.
             return None
@@ -457,7 +448,7 @@ def daily_job():
     db = SessionLocal()
     try:
         # Picks a teacher who hasn't been Teacher of the Day in the last 90 days
-        chosen_teacher = fetch_teacher_for_tod()
+        chosen_teacher = fetch_teacher_for_tod(db)
 
         if chosen_teacher:
             teacher_info = {
@@ -761,12 +752,11 @@ def model_to_dict(model):
 ###api used to register a new user (and only a new user) into the new_user list
 @app.post("/profile/register/")
 @limiter.limit("5/minute")
-async def register_user(request: Request, name: str = Form(...), email: str = Form(...), phone_number: str = Form(...), password: str = Form(...), confirm_password: str = Form(...), state: str = Form(...),county: str = Form(...),district: str = Form(...), school: str = Form(...), recaptcha_response: str = Form(...)):
+async def register_user(request: Request, name: str = Form(...), email: str = Form(...), phone_number: str = Form(...), password: str = Form(...), confirm_password: str = Form(...), state: str = Form(...),county: str = Form(...),district: str = Form(...), school: str = Form(...), recaptcha_response: str = Form(...), db: Session = Depends(get_db)):
     # Verify reCAPTCHA
     if not verify_recaptcha(recaptcha_response):
         raise HTTPException(status_code=400, detail="reCAPTCHA verification failed. Please try again.")
 
-    db = SessionLocal()
     try:
         query = select(RegisteredUsers.id).where(cast(RegisteredUsers.email, String) == cast(email, String))
         result = db.execute(query)
@@ -795,8 +785,7 @@ async def register_user(request: Request, name: str = Form(...), email: str = Fo
 ###api used to create cookie based session via authentication with registered_user table
 @app.post("/profile/login/")
 @limiter.limit("5/minute")
-async def login_user(request: Request, email: str = Form(...), password: str = Form(...)):
-    db = SessionLocal()
+async def login_user(request: Request, email: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
     try:
         query = select(RegisteredUsers).where(cast(RegisteredUsers.email, String) == cast(email, String))
         result = db.execute(query)
@@ -817,8 +806,6 @@ async def login_user(request: Request, email: str = Form(...), password: str = F
     except Exception as e:
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")
-    finally:
-        db.close()
 
 ##end cookie session
 @app.post("/profile/logout/")
@@ -831,10 +818,9 @@ async def logout_user(request: Request):
 
 # Endpoint to move a user from new_users to registered_users and delete item in new_users
 @app.post("/validation/validate_user/{user_email}")
-async def move_user(user_email: str, role: str = Depends(get_current_role), request: Request = None):
+async def move_user(user_email: str, role: str = Depends(get_current_role), request: Request = None, db: Session = Depends(get_db)):
     if role not in ('admin', 'teacher'):
         raise HTTPException(status_code=403, detail="Access denied.")
-    db = SessionLocal()
     try:
         query = select(NewUsers).where(cast(NewUsers.email, String) == cast(user_email, String))
         result = db.execute(query)
@@ -866,13 +852,10 @@ async def move_user(user_email: str, role: str = Depends(get_current_role), requ
         db.rollback()
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")
-    finally:
-        db.close()
 
 ##this api allows a logged in user to create an item in the table teacher_list in the hithero database if they have not created a user already
 @app.post("/profile/create_teacher_profile/")
-async def create_teacher_profile(request: Request, name: str = Form(...), state: str = Form(...), county: str = Form(...), district: str = Form(...), school: str = Form(...), aboutMe: str = Form(...), wishlist: str = Form(...), id: int = Depends(get_current_id), role: str = Depends(get_current_role)):
-    db = SessionLocal()
+async def create_teacher_profile(request: Request, name: str = Form(...), state: str = Form(...), county: str = Form(...), district: str = Form(...), school: str = Form(...), aboutMe: str = Form(...), wishlist: str = Form(...), id: int = Depends(get_current_id), role: str = Depends(get_current_role), db: Session = Depends(get_db)):
     try:
         if role:
             query = select(RegisteredUsers.createCount).where(RegisteredUsers.id == id)
@@ -911,15 +894,13 @@ async def create_teacher_profile(request: Request, name: str = Form(...), state:
     except Exception as e:
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")
-    finally:
-        db.close()
 
 ##api gets a random teacher from the list teacher_list in the hithero data base
 
 @app.get("/api/random_teacher/")
-async def get_random_teacher(request: Request):
+async def get_random_teacher(request: Request, db: Session = Depends(get_db)):
     try:
-        teacher = fetch_random_teacher()
+        teacher = fetch_random_teacher(db)
         if not teacher:
             raise HTTPException(status_code=404, detail="No teachers found in the database")
         if teacher.image_data:
@@ -1020,8 +1001,7 @@ async def forbidden(request: Request, exc: HTTPException):
 
 ###api gets a teacher data from teacher_list table
 @app.get("/api/get_teacher_info/")
-async def get_teacher_info(request: Request):
-    db = SessionLocal()
+async def get_teacher_info(request: Request, db: Session = Depends(get_db)):
     try:
         state = get_index_cookie('state', request)
         county = get_index_cookie('county', request)
@@ -1058,13 +1038,10 @@ async def get_teacher_info(request: Request):
     except Exception as e:
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")
-    finally:
-        db.close()
 
 ##api that updates about me info
 @app.post("/profile/update_info/")
-async def update_info(request: Request, aboutMe: str = Form(...), id: int = Depends(get_current_id), role: str = Depends(get_current_role)):
-    db = SessionLocal()
+async def update_info(request: Request, aboutMe: str = Form(...), id: int = Depends(get_current_id), role: str = Depends(get_current_role), db: Session = Depends(get_db)):
     try:
         if role:
             update_query = update(TeacherList).where(TeacherList.regUserID == id).values(about_me=aboutMe)
@@ -1076,8 +1053,6 @@ async def update_info(request: Request, aboutMe: str = Form(...), id: int = Depe
     except Exception as e:
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")
-    finally:
-        db.close()
 
 ##api that updates school
 @app.post("/profile/update_teacher_school/")
@@ -1088,9 +1063,8 @@ async def update_teacher_school(
     district: str = Form(...),
     school: str = Form(...),
     id: int = Depends(get_current_id),
-    role: str = Depends(get_current_role)
+    role: str = Depends(get_current_role), db: Session = Depends(get_db)
 ):
-    db: Session = SessionLocal()
     try:
         if role:
             update_query = update(TeacherList).where(TeacherList.regUserID == id).values(
@@ -1108,13 +1082,10 @@ async def update_teacher_school(
         db.rollback()
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")
-    finally:
-        db.close()
 
 ##api that updates name
 @app.post("/profile/update_teacher_name/")
-async def update_teacher_name(request: Request, teacher: str = Form(...), id: int = Depends(get_current_id), role: str = Depends(get_current_role)):
-    db = SessionLocal()
+async def update_teacher_name(request: Request, teacher: str = Form(...), id: int = Depends(get_current_id), role: str = Depends(get_current_role), db: Session = Depends(get_db)):
     try:
         if role:
             update_query = update(TeacherList).where(TeacherList.regUserID == id).values(name=teacher)
@@ -1127,13 +1098,10 @@ async def update_teacher_name(request: Request, teacher: str = Form(...), id: in
         db.rollback()
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")
-    finally:
-        db.close()
 
 ##api to update wishlist
 @app.post("/profile/update_wishlist/")
-async def update_wishlist(request: Request, wishlist: str = Form(...), id: int = Depends(get_current_id), role: str = Depends(get_current_role)):
-    db = SessionLocal()
+async def update_wishlist(request: Request, wishlist: str = Form(...), id: int = Depends(get_current_id), role: str = Depends(get_current_role), db: Session = Depends(get_db)):
     try:
         if role:
             aa_link = wishlist + "&tag=h0mer00mher0-20"
@@ -1146,14 +1114,11 @@ async def update_wishlist(request: Request, wishlist: str = Form(...), id: int =
     except Exception as e:
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")
-    finally:
-        db.close()
 
 
 #api that update the url of a teachers page
 @app.post("/profile/update_url_id/")
-async def update_url_id(request: Request, url_id: str = Form(...), id: int = Depends(get_current_id), role: str = Depends(get_current_role)):
-    db = SessionLocal()
+async def update_url_id(request: Request, url_id: str = Form(...), id: int = Depends(get_current_id), role: str = Depends(get_current_role), db: Session = Depends(get_db)):
     try:
         if role:
             if not re.match(r'^[a-zA-Z0-9_-]{3,50}$', url_id):
@@ -1172,14 +1137,11 @@ async def update_url_id(request: Request, url_id: str = Form(...), id: int = Dep
     except Exception as e:
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")
-    finally:
-        db.close()
 
     
 ###api used to update the logged in users teacher page image
 @app.post("/profile/update_teacher_image/")
-async def edit_teacher_image(request: Request, role: str = Depends(get_current_role), image: UploadFile = Form(...), id: int = Depends(get_current_id)):
-    db: Session = SessionLocal()
+async def edit_teacher_image(request: Request, role: str = Depends(get_current_role), image: UploadFile = Form(...), id: int = Depends(get_current_id), db: Session = Depends(get_db)):
     try:
         if image.size > MAX_FILE_SIZE:
             raise HTTPException(status_code=400, detail="File size exceeds the allowed limit")
@@ -1213,14 +1175,11 @@ async def edit_teacher_image(request: Request, role: str = Depends(get_current_r
     except Exception as e:
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")
-    finally:
-        db.close()
 
 
 ##api gets your page based on the id in reg_users and and regUserID in teacher_list
 @app.get("/profile/myinfo/")
-async def get_myinfo(request: Request, id: int = Depends(get_current_id)):
-    db = SessionLocal()
+async def get_myinfo(request: Request, id: int = Depends(get_current_id), db: Session = Depends(get_db)):
     try:
         query = select(TeacherList).where(TeacherList.regUserID == id)
         result = db.execute(query)
@@ -1242,14 +1201,11 @@ async def get_myinfo(request: Request, id: int = Depends(get_current_id)):
     except Exception as e:
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")
-    finally:
-        db.close()
 
 
 ##api lets the logged in user update their password
 @app.post("/profile/update_password/")
-async def update_password(request: Request, id: int = Depends(get_current_id), old_password: str = Form(...), new_password: str = Form(...), new_password_confirmed: str = Form(...)):
-    db = SessionLocal()
+async def update_password(request: Request, id: int = Depends(get_current_id), old_password: str = Form(...), new_password: str = Form(...), new_password_confirmed: str = Form(...), db: Session = Depends(get_db)):
     try:
         if new_password == new_password_confirmed:
             query = select(RegisteredUsers.password).where(RegisteredUsers.id == id)
@@ -1268,14 +1224,11 @@ async def update_password(request: Request, id: int = Depends(get_current_id), o
     except Exception as e:
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")
-    finally:
-        db.close()
 
 
 #api to check if a user has edit acces to teacher page
 @app.get("/api/check_access_teacher/")
-async def check_access_teacher(request: Request, id: int = Depends(get_current_id), role: str = Depends(get_current_role)):
-    db = SessionLocal()
+async def check_access_teacher(request: Request, id: int = Depends(get_current_id), role: str = Depends(get_current_role), db: Session = Depends(get_db)):
     try:
         if role == 'teacher':
             state = get_index_cookie('state', request)
@@ -1298,14 +1251,11 @@ async def check_access_teacher(request: Request, id: int = Depends(get_current_i
     except Exception as e:
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")
-    finally:
-        db.close()
 
 
 #gets a list of unverified users to validate based on the role of the user
 @app.get("/api/validation_list/")
-async def validation_page(request: Request, role: str = Depends(get_current_role), id: int = Depends(get_current_id)):
-    db = SessionLocal()
+async def validation_page(request: Request, role: str = Depends(get_current_role), id: int = Depends(get_current_id), db: Session = Depends(get_db)):
     try:
         if role == "admin":
             query = select(NewUsers)
@@ -1313,7 +1263,7 @@ async def validation_page(request: Request, role: str = Depends(get_current_role
             new_users = result.fetchall()
             return {"new_users": [{"name": user[0].name, "email": user[0].email, "state": user[0].state, "district": user[0].district, "school": user[0].school, "phone_number": user[0].phone_number, "report": user[0].report, "emailed": user[0].emailed} for user in new_users], "role": role}
         if role == 'teacher':
-            store_my_cookies(request, id)
+            store_my_cookies(request, id, db)
             state = get_index_cookie('state', request)
             county = get_index_cookie('county', request)
             district = get_index_cookie('district', request)
@@ -1330,72 +1280,53 @@ async def validation_page(request: Request, role: str = Depends(get_current_role
     except Exception as e:
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")          
-    finally:
-        db.close()
 
 
 #api gets a list of states from statecoutny table
 @app.get("/api/get_states/")
-async def get_states():
-    db = SessionLocal()
-    try:
-        states = db.query(School.state).distinct().all()
-        return sorted([state[0] for state in states])
-    finally:
-        db.close()
+async def get_states(db: Session = Depends(get_db)):
+    states = db.query(School.state).distinct().all()
+    return sorted([state[0] for state in states])
 
 #api gets the names of the counties in the desired state
 @app.get("/api/get_counties/{state}")
-async def get_counties(state: str):
-    db = SessionLocal()
-    try:
-        query = select(School.county).distinct().where(School.state == state)
-        result = db.execute(query)
-        counties = result.fetchall()
-        if counties:
-            county_names = sorted([county[0] for county in counties])
-            return county_names
-        else:
-            return {"message": f"No counties found for state: {state}"}
-    finally:
-        db.close()
+async def get_counties(state: str, db: Session = Depends(get_db)):
+    query = select(School.county).distinct().where(School.state == state)
+    result = db.execute(query)
+    counties = result.fetchall()
+    if counties:
+        county_names = sorted([county[0] for county in counties])
+        return county_names
+    else:
+        return {"message": f"No counties found for state: {state}"}
 
 #api gets the names of the school districts in the desired county and state
 @app.get("/api/get_districts/{state}/{county}")
-async def get_districts(state: str, county: str):
-    db = SessionLocal()
-    try:
-        query = select(School.district).distinct().where((School.state == state) & (School.county == county))
-        result = db.execute(query)
-        districts = result.fetchall()
-        if districts:
-            district_names = sorted([district[0] for district in districts])
-            return district_names
-        else:
-            return {"message": f"No districts found for state: {state} and county: {county}"}
-    finally:
-        db.close()
+async def get_districts(state: str, county: str, db: Session = Depends(get_db)):
+    query = select(School.district).distinct().where((School.state == state) & (School.county == county))
+    result = db.execute(query)
+    districts = result.fetchall()
+    if districts:
+        district_names = sorted([district[0] for district in districts])
+        return district_names
+    else:
+        return {"message": f"No districts found for state: {state} and county: {county}"}
 
 #api gets the names of the school in the desired district, coutny, and state
 @app.get("/api/get_schools/{state}/{county}/{district}")
-async def get_schools(state: str, county: str, district: str):
-    db = SessionLocal()
-    try:
-        query = select(School.school_name).distinct().where((School.state == state) & (School.county == county) & (School.district == district))
-        result = db.execute(query)
-        schools = result.fetchall()
-        if schools:
-            school_names = sorted([school[0] for school in schools])
-            return school_names
-        else:
-            return {"message": f"No schools found for state: {state}, county: {county}, and district: {district}"}
-    finally:
-        db.close()
+async def get_schools(state: str, county: str, district: str, db: Session = Depends(get_db)):
+    query = select(School.school_name).distinct().where((School.state == state) & (School.county == county) & (School.district == district))
+    result = db.execute(query)
+    schools = result.fetchall()
+    if schools:
+        school_names = sorted([school[0] for school in schools])
+        return school_names
+    else:
+        return {"message": f"No schools found for state: {state}, county: {county}, and district: {district}"}
 
 @app.post("/profile/forgot_password/")
 @limiter.limit("5/minute")
-async def forgot_password(request: Request, email: str = Form(...)):
-    db = SessionLocal()
+async def forgot_password(request: Request, email: str = Form(...), db: Session = Depends(get_db)):
     try:
         query = select(RegisteredUsers.id).where(cast(RegisteredUsers.email, String) == cast(email, String))
         result = db.execute(query)
@@ -1429,12 +1360,9 @@ async def forgot_password(request: Request, email: str = Form(...)):
         db.rollback()
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")
-    finally:
-        db.close()
     
 @app.post("/profile/reset_password/")
-async def reset_password(token: str = Form(...), new_password: str = Form(...), confirm_password: str = Form(...)):
-    db = SessionLocal()
+async def reset_password(token: str = Form(...), new_password: str = Form(...), confirm_password: str = Form(...), db: Session = Depends(get_db)):
     try:
         if new_password != confirm_password:
             raise HTTPException(status_code=400, detail="Passwords do not match.")
@@ -1461,13 +1389,10 @@ async def reset_password(token: str = Form(...), new_password: str = Form(...), 
         db.rollback()
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")
-    finally:
-        db.close()
 
 #api that gets today's Teacher of the Day (whoever has the most recent last_TOD)
 @app.get("/api/teacher_of_the_day")
-async def get_teacher_of_the_day(request: Request):
-    db = SessionLocal()
+async def get_teacher_of_the_day(request: Request, db: Session = Depends(get_db)):
     try:
         query = (
             select(TeacherList)
@@ -1507,13 +1432,10 @@ async def get_teacher_of_the_day(request: Request):
     except Exception as e:
         logger.error(f"Internal Server Error: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
-    finally:
-        db.close()
 
 ###api to get a link for the url to your page to share
 @app.get("/api/teacher_url/")
-async def get_teacher_url(request: Request):
-    db = SessionLocal()
+async def get_teacher_url(request: Request, db: Session = Depends(get_db)):
     try:
         state = get_index_cookie('state', request)
         county = get_index_cookie('county', request)
@@ -1539,8 +1461,7 @@ async def get_teacher_url(request: Request):
 
 ##this api gets the token, gets the data, sets the data, then redirects
 @app.get("/teacher/{url_id}")
-async def get_teacher_info(url_id: str, request: Request):
-    db = SessionLocal()
+async def get_teacher_info(url_id: str, request: Request, db: Session = Depends(get_db)):
     try:
         query = select(TeacherList).where(cast(TeacherList.url_id, String) == url_id)
         result = db.execute(query)
@@ -1559,9 +1480,8 @@ async def get_teacher_info(url_id: str, request: Request):
 
 # Endpoint to  users
 @app.post("/validation/delete_user/{user_email}")
-async def delete_user(user_email: str, role: str = Depends(get_current_role)):
+async def delete_user(user_email: str, role: str = Depends(get_current_role), db: Session = Depends(get_db)):
     if role == 'admin':
-        db = SessionLocal()
         try:
             query = select(NewUsers).where(cast(NewUsers.email, String) == cast(user_email, String))
             result = db.execute(query)
@@ -1576,17 +1496,14 @@ async def delete_user(user_email: str, role: str = Depends(get_current_role)):
             db.rollback()
             logger.error(f"Internal Server Error: {str(e)}") 
             raise HTTPException(status_code=500, detail="Internal Server Error")
-        finally:
-            db.close()
     else:
         raise HTTPException(status_code=403, detail=f"No permission to to action.")
 
 # Function to report a user in validation
 @app.post("/validation/report_user/{user_email}")
-async def report_user(user_email: str, role: str = Depends(get_current_role)):
+async def report_user(user_email: str, role: str = Depends(get_current_role), db: Session = Depends(get_db)):
     if role not in ('admin', 'teacher'):
         raise HTTPException(status_code=403, detail="Access denied.")
-    db = SessionLocal()
     try:
         update_query = update(NewUsers).where(cast(NewUsers.email, String) == cast(user_email, String)).values(report=1)
         db.execute(update_query)
@@ -1596,15 +1513,12 @@ async def report_user(user_email: str, role: str = Depends(get_current_role)):
         db.rollback()
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")
-    finally:
-        db.close()
 
 # Endpoint to mark that a new users has been emailed
 @app.post("/validation/emailed_user/{user_email}")
-async def emailed_user(user_email: str, role: str = Depends(get_current_role)):
+async def emailed_user(user_email: str, role: str = Depends(get_current_role), db: Session = Depends(get_db)):
     if role not in ('admin', 'teacher'):
         raise HTTPException(status_code=403, detail="Access denied.")
-    db = SessionLocal()
     try:
         update_query = update(NewUsers).where(cast(NewUsers.email, String) == cast(user_email, String)).values(emailed=1)
         db.execute(update_query)
@@ -1614,102 +1528,79 @@ async def emailed_user(user_email: str, role: str = Depends(get_current_role)):
         db.rollback()
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail="Internal Server Error")
-    finally:
-        db.close()
 
 
 #api gets a list of states from statecoutny table
 @app.get("/api/index_states/")
-async def index_states():
-    db = SessionLocal()
-    try:
-        states = db.query(cast(TeacherList.state, String)).distinct().all()
-        return sorted([state[0] for state in states])
-    finally:
-        db.close()
+async def index_states(db: Session = Depends(get_db)):
+    states = db.query(cast(TeacherList.state, String)).distinct().all()
+    return sorted([state[0] for state in states])
 
 #api gets the names of the counties in the desired state
 @app.get("/api/index_counties/{state}")
-async def index_counties(state: str):
-    db = SessionLocal()
-    try:
-        query = select(cast(TeacherList.county, String)).distinct().where(cast(TeacherList.state, String) == state)
-        result = db.execute(query)
-        counties = result.fetchall()
-        if counties:
-            county_names = sorted([county[0] for county in counties])
-            return county_names
-        else:
-            return {"message": f"No counties found for state: {state}"}
-    finally:
-        db.close()
+async def index_counties(state: str, db: Session = Depends(get_db)):
+    query = select(cast(TeacherList.county, String)).distinct().where(cast(TeacherList.state, String) == state)
+    result = db.execute(query)
+    counties = result.fetchall()
+    if counties:
+        county_names = sorted([county[0] for county in counties])
+        return county_names
+    else:
+        return {"message": f"No counties found for state: {state}"}
 
 #api gets the names of the school districts in the desired county and state
 @app.get("/api/index_districts/{state}/{county}")
-async def index_districts(state: str, county: str):
-    db = SessionLocal()
-    try:
-        query = select(cast(TeacherList.district, String)).distinct().where((cast(TeacherList.state, String) == state) & (cast(TeacherList.county, String) == county))
-        result = db.execute(query)
-        districts = result.fetchall()
-        if districts:
-            district_names = sorted([district[0] for district in districts])
-            return district_names
-        else:
-            return {"message": f"No districts found for state: {state} and county: {county}"}
-    finally:
-        db.close()
+async def index_districts(state: str, county: str, db: Session = Depends(get_db)):
+    query = select(cast(TeacherList.district, String)).distinct().where((cast(TeacherList.state, String) == state) & (cast(TeacherList.county, String) == county))
+    result = db.execute(query)
+    districts = result.fetchall()
+    if districts:
+        district_names = sorted([district[0] for district in districts])
+        return district_names
+    else:
+        return {"message": f"No districts found for state: {state} and county: {county}"}
 
 #api gets the names of the school in the desired district, coutny, and state
 @app.get("/api/index_schools/{state}/{county}/{district}")
-async def index_schools(state: str, county: str, district: str):
-    db = SessionLocal()
-    try:
-        query = select(cast(TeacherList.school, String)).distinct().where((cast(TeacherList.state, String) == state) & (cast(TeacherList.county, String) == county) & (cast(TeacherList.district, String) == district))       
-        result = db.execute(query)
-        schools = result.fetchall()
-        if schools:
-            school_names = sorted([school[0] for school in schools])
-            return school_names
-        else:
-            return {"message": f"No schools found for state: {state}, county: {county}, and district: {district}"}
-    finally:
-        db.close()
+async def index_schools(state: str, county: str, district: str, db: Session = Depends(get_db)):
+    query = select(cast(TeacherList.school, String)).distinct().where((cast(TeacherList.state, String) == state) & (cast(TeacherList.county, String) == county) & (cast(TeacherList.district, String) == district))       
+    result = db.execute(query)
+    schools = result.fetchall()
+    if schools:
+        school_names = sorted([school[0] for school in schools])
+        return school_names
+    else:
+        return {"message": f"No schools found for state: {state}, county: {county}, and district: {district}"}
 
 ###api gets the teachers and their url_id for the index
 @app.post("/api/index_teachers/")
-async def index_teachers(state: str = Form(...),county: str = Form(None),district: str = Form(None),school: str = Form(None)):
-    db: Session = SessionLocal()
-    try:
-        query = select(TeacherList.name, TeacherList.url_id).where(
-            (cast(TeacherList.state, String) == state)
+async def index_teachers(state: str = Form(...),county: str = Form(None),district: str = Form(None),school: str = Form(None), db: Session = Depends(get_db)):
+    query = select(TeacherList.name, TeacherList.url_id).where(
+        (cast(TeacherList.state, String) == state)
+    )
+
+    if county:
+        query = query.where(cast(TeacherList.county, String) == county)
+    if district:
+        query = query.where(cast(TeacherList.district, String) == district)
+    if school:
+        query = query.where(cast(TeacherList.school, String) == school)
+
+    result = db.execute(query)
+    teachers = result.fetchall()
+
+    if teachers:
+        return [{"name": teacher.name, "url_id": teacher.url_id} for teacher in teachers]
+    else:
+        raise HTTPException(
+            status_code=404,
+            detail="No teachers found with the given criteria."
         )
 
-        if county:
-            query = query.where(cast(TeacherList.county, String) == county)
-        if district:
-            query = query.where(cast(TeacherList.district, String) == district)
-        if school:
-            query = query.where(cast(TeacherList.school, String) == school)
-
-        result = db.execute(query)
-        teachers = result.fetchall()
-
-        if teachers:
-            return [{"name": teacher.name, "url_id": teacher.url_id} for teacher in teachers]
-        else:
-            raise HTTPException(
-                status_code=404,
-                detail="No teachers found with the given criteria."
-            )
-    finally:
-        db.close()
-
 @app.post("/admin/generate_teacher_report/")
-async def generate_teacher_report(state: str = Form(...), county: str = Form(None), district: str = Form(None), school: str = Form(None), role: str = Depends(get_current_role)):
+async def generate_teacher_report(state: str = Form(...), county: str = Form(None), district: str = Form(None), school: str = Form(None), role: str = Depends(get_current_role), db: Session = Depends(get_db)):
     if role != 'admin':
         raise HTTPException(status_code=403, detail="Access denied: Only administrators can generate reports.")
-    db: Session = SessionLocal()
     try:
         # Step 1: Dynamically filter TeacherList based on provided fields (excluding regUserID)
         query = select(
@@ -1783,8 +1674,6 @@ async def generate_teacher_report(state: str = Form(...), county: str = Form(Non
         logger.error(f"Report generation error: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
-    finally:
-        db.close()
 
 # --- Modified API Endpoint for Promotional Items ---
 @app.get("/{token}", response_class=HTMLResponse)
@@ -1832,10 +1721,9 @@ async def get_promo_info(request: Request):
 
 @app.post("/forum/create_post")
 @limiter.limit("5/minute")
-def create_post(request: Request, title: str = Form(...), content: str = Form(...), user_id: int = Depends(get_current_id)):
+def create_post(request: Request, title: str = Form(...), content: str = Form(...), user_id: int = Depends(get_current_id), db: Session = Depends(get_db)):
     if not user_id:
         raise HTTPException(status_code=401, detail="You must be logged in to post.")
-    db: Session = SessionLocal()
     # 1. Create a new ForumPost instance
     new_post = ForumPost(
         title=bleach.clean(title, tags=ALLOWED_TAGS, attributes=ALLOWED_ATTRS, strip=True),
@@ -1860,7 +1748,7 @@ def create_post(request: Request, title: str = Form(...), content: str = Form(..
     return new_post
 
 @app.get("/forum/get_posts")
-def get_posts():
+def get_posts(db: Session = Depends(get_db)):
     """
     Retrieves a list of all forum posts.
 
@@ -1869,7 +1757,6 @@ def get_posts():
     to use upvotes first:
     .order_by(ForumPost.upvotes.desc(), ForumPost.created_at.desc())
     """
-    db: Session = SessionLocal()
    
     try:
         # Query all posts and order them by the 'created_at' column descending.
@@ -1884,13 +1771,12 @@ def get_posts():
         )
 
 @app.get("/forum/get_post")
-def get_post(post_id: int):
+def get_post(post_id: int, db: Session = Depends(get_db)):
     """
     Retrieves a single forum post using its unique ID.
     
     Raises HTTPException 404 if the post is not found.
     """
-    db: Session = SessionLocal()
     
     try:
         # Query the database for a single post matching the provided ID
@@ -1916,11 +1802,10 @@ def get_post(post_id: int):
         )
 
 @app.post("/forum/posts/{post_id}/vote")
-def handle_post_vote(post_id: int, vote_data: VoteInput, user_id: int = Depends(get_current_id)):
+def handle_post_vote(post_id: int, vote_data: VoteInput, user_id: int = Depends(get_current_id), db: Session = Depends(get_db)):
     if not user_id:
         raise HTTPException(status_code=401, detail="You must be logged in to post.")
 
-    db: Session = SessionLocal()
     vote_type = vote_data.vote_type
 
     # 1. Input validation
@@ -1985,11 +1870,9 @@ def handle_post_vote(post_id: int, vote_data: VoteInput, user_id: int = Depends(
 
 @app.post("/forum/posts/{post_id}/comment", summary="Add a new comment to a specific post")
 @limiter.limit("5/minute")
-def add_comment_to_post(request: Request, post_id: int, content: str = Form(...), parent_comment_id: Optional[int] = Form(None), user_id: int = Depends(get_current_id)):
+def add_comment_to_post(request: Request, post_id: int, content: str = Form(...), parent_comment_id: Optional[int] = Form(None), user_id: int = Depends(get_current_id), db: Session = Depends(get_db)):
     if not user_id:
         raise HTTPException(status_code=401, detail="You must be logged in to post.")
-    # Assuming SessionLocal() correctly creates a DB session
-    db: Session = SessionLocal() 
 
     # 1. Check if the parent post exists
     post = db.query(ForumPost).filter(ForumPost.id == post_id).first()
@@ -2039,11 +1922,10 @@ def add_comment_to_post(request: Request, post_id: int, content: str = Form(...)
 
 
 @app.get("/forum/comments/{post_id}/")
-def get_comments_for_post(post_id: int = Path(..., gt=0),) -> List[dict]:
+def get_comments_for_post(post_id: int = Path(..., gt=0), db: Session = Depends(get_db)) -> List[dict]:
     """
     Fetches all comments associated with a specific post, ordered by creation date (newest first).
     """
-    db: Session = SessionLocal()
     
     # 1. Check if the parent post exists (Optional, but good practice)
     post = db.query(ForumPost).filter(ForumPost.id == post_id).first()
@@ -2070,11 +1952,10 @@ def get_comments_for_post(post_id: int = Path(..., gt=0),) -> List[dict]:
             detail="Could not retrieve comments due to a server error."
         )
 @app.delete("/forum/post/{post_id}/delete")
-def delete_post(post_id: int, role: str = Depends(get_current_role)):
+def delete_post(post_id: int, role: str = Depends(get_current_role), db: Session = Depends(get_db)):
     """
     Deletes a post. Only allowed for role = 'admin'.
     """
-    db: Session = SessionLocal()
     # 1. Authorization Check (Admin Only)
     if role != 'admin':
         print(f"User attempted unauthorized post deletion.")
@@ -2096,11 +1977,10 @@ def delete_post(post_id: int, role: str = Depends(get_current_role)):
     return
 
 @app.delete("/forum/comment/{comment_id}/delete")
-def delete_comment(comment_id: int, current_user_id: int = Depends(get_current_id),role: str = Depends(get_current_role)):
+def delete_comment(comment_id: int, current_user_id: int = Depends(get_current_id),role: str = Depends(get_current_role), db: Session = Depends(get_db)):
     """
     Deletes a comment. Only allowed for admin OR the comment's author (not yet but can be if you uncomment below)
     """
-    db: Session = SessionLocal()
     # 1. Find the comment
     comment = db.query(ForumComment).filter(ForumComment.id == comment_id).first()
     
@@ -2139,12 +2019,11 @@ def delete_comment(comment_id: int, current_user_id: int = Depends(get_current_i
     return {"detail": f"Comment ID {comment_id} successfully deleted."}
 
 @app.patch("/forum/post/{post_id}/update")
-async def update_post(post_id: int, post_data: PostUpdate, id: int = Depends(get_current_id)):
+async def update_post(post_id: int, post_data: PostUpdate, id: int = Depends(get_current_id), db: Session = Depends(get_db)):
     """
     Allows the author of a post to update its title and content.
     """
     
-    db: Session = SessionLocal()
     
     try:
         # 1. Fetch the existing post
@@ -2181,15 +2060,12 @@ async def update_post(post_id: int, post_data: PostUpdate, id: int = Depends(get
         # In a production environment, log the error 'e' here
         raise HTTPException(status_code=500, detail="Internal server error during post update.")
         
-    finally:
-        db.close()
 
 @app.patch("/forum/comment/{comment_id}/update")
-async def update_comment(comment_id: int, content: str = Form(...), user: int = Depends(get_current_id)):
+async def update_comment(comment_id: int, content: str = Form(...), user: int = Depends(get_current_id), db: Session = Depends(get_db)):
     """
     Allows the author of a comment to update its content.
     """
-    db: Session = SessionLocal()
     
     try:
         # 1. Fetch the existing comment
@@ -2220,18 +2096,15 @@ async def update_comment(comment_id: int, content: str = Form(...), user: int = 
         db.rollback()
         raise HTTPException(status_code=500, detail="Internal server error during comment update.")
         
-    finally:
-        db.close()
 
 
 @app.post("/profile/delete/")
-async def admin_delete_user_account(target_email: str = Form(...), admin_secret_input: str = Form(...),current_role: str = Depends(get_current_role)):
+async def admin_delete_user_account(target_email: str = Form(...), admin_secret_input: str = Form(...),current_role: str = Depends(get_current_role), db: Session = Depends(get_db)):
     """
     Allows an authenticated 'admin' user to delete *any* user account 
     by providing the target user's email and a secret key via form submission.
     Deletes the associated teacher entry and the registered user account.
     """
-    db: Session = SessionLocal()
     
     # 1. ROLE CHECK: Ensure the current user is an admin
     if not current_role or current_role != 'admin':
@@ -2279,8 +2152,6 @@ async def admin_delete_user_account(target_email: str = Form(...), admin_secret_
         print(f"Error during administrative account deletion for {target_email}: {str(e)}")
         logger.error(f"Internal Server Error: {str(e)}") 
         raise HTTPException(status_code=500, detail=f"Internal Server Error")
-    finally:
-        db.close()
 
 
 @app.post("/admin/create_admin/")
@@ -2291,7 +2162,7 @@ async def create_admin_account(
     password: str = Form(...),
     confirm_password: str = Form(...),
     admin_secret_input: str = Form(...),
-    current_role: str = Depends(get_current_role)
+    current_role: str = Depends(get_current_role), db: Session = Depends(get_db)
 ):
     """
     Allows an authenticated 'admin' user, who also supplies the server's admin
@@ -2313,7 +2184,6 @@ async def create_admin_account(
     if len(password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters long.")
 
-    db: Session = SessionLocal()
     try:
         # 4. Make sure this email isn't already in use, in either table
         existing_registered = db.execute(
@@ -2343,8 +2213,6 @@ async def create_admin_account(
         db.rollback()
         logger.error(f"Error creating admin account: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
-    finally:
-        db.close()
 
 
 if __name__ == "__main__":
