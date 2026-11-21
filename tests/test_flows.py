@@ -135,6 +135,13 @@ def test_forgot_and_reset_password(fresh_db, monkeypatch):
     assert r.json() == {"message": "If an account exists, a reset link will be sent to your email."}
     token = re.search(r"token=([\w-]+)", outbox.sent[-1]["content"]["plainText"]).group(1)
 
+    # BE2-11: the table holds only the token's hash, never the mailed token.
+    from models import PasswordResetToken
+    with app.SessionLocal() as db:
+        stored = [row.token for row in db.query(PasswordResetToken).all()]
+    assert token not in stored
+    assert len(stored) == 1 and len(stored[0]) == len(token) == 43
+
     # Unknown address: same answer, no email.
     monkeypatch.setattr(app.time, "sleep", lambda s: None)
     sent_before = len(outbox.sent)
@@ -383,3 +390,26 @@ def test_admin_report_and_account_actions(fresh_db):
     assert helpers.client().get("/teacher/carol42").headers["location"] == "/pages/404.html"
     r = admin.post("/profile/delete/", data={"target_email": "nobody@example.com", "admin_secret_input": secret})
     assert r.status_code == 404
+
+
+def test_login_upgrades_legacy_password_hash(fresh_db):
+    """BE2-11: seed users hold sha256_crypt hashes (like production today).
+    A successful login swaps in an argon2 hash, and the same password keeps
+    working. A wrong password changes nothing."""
+    import app
+    from repositories import users
+
+    def stored_hash():
+        with app.SessionLocal() as db:
+            return users.password_hash(db, 3)
+
+    assert stored_hash().startswith("$5$")
+    assert login(helpers.client(), "bob@example.com", "wrong").json() == {"message": "Invalid login credentials."}
+    assert stored_hash().startswith("$5$")
+
+    assert login(helpers.client(), "bob@example.com").json()["message"] == "Login successful as teacher"
+    upgraded = stored_hash()
+    assert upgraded.startswith("$argon2id$")
+    assert login(helpers.client(), "bob@example.com").json()["message"] == "Login successful as teacher"
+    assert stored_hash() == upgraded
+    assert login(helpers.client(), "bob@example.com", "wrong").json() == {"message": "Invalid login credentials."}

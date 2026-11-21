@@ -12,6 +12,10 @@ anyio==4.16.0
     # via
     #   fastapi
     #   starlette
+argon2-cffi==25.1.0
+    # via -r requirements.in
+argon2-cffi-bindings==26.2.0
+    # via argon2-cffi
 azure-communication-email==1.1.0
     # via -r requirements.in
 azure-core==1.41.0
@@ -20,6 +24,8 @@ bleach==6.4.0
     # via -r requirements.in
 certifi==2026.11.20
     # via requests
+cffi==2.1.1
+    # via argon2-cffi-bindings
 charset-normalizer==3.5.2
     # via
     #   reportlab
@@ -65,6 +71,8 @@ pillow==13.0.0
     # via reportlab
 puremagic==2.3.0
     # via -r requirements.in
+pycparser==3.12
+    # via cffi
 pydantic==2.14.4
     # via
     #   -r requirements.in
