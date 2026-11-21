@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     database_password: str
     database_port: int = 1433
     database_driver: str = "ODBC Driver 18 for SQL Server"
+    # Extra ODBC connection options, as JSON, e.g. {"TrustServerCertificate": "yes"}
+    database_options: dict[str, str] = {}
 
     # Azure Communication Services email
     azure_email_connection_string: str | None = None

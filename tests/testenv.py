@@ -45,22 +45,10 @@ def configure(force_database: bool = False) -> None:
     for key, value in TEST_ENV.items():
         os.environ.setdefault(key, value)
 
-    import sqlalchemy
-
     if force_database or use_database():
         # The local container uses a self-signed certificate, which ODBC
-        # Driver 18 rejects by default. app.py builds its URL with an
-        # f-string, so add TrustServerCertificate here. BE2-4 replaces this
-        # with a setting in db.py.
-        real_create_engine = sqlalchemy.create_engine
-
-        def create_engine(url, *args, **kwargs):
-            url = sqlalchemy.engine.make_url(url).update_query_dict(
-                {"TrustServerCertificate": "yes"}
-            )
-            return real_create_engine(url, *args, **kwargs)
-
-        sqlalchemy.create_engine = create_engine
+        # Driver 18 rejects by default.
+        os.environ.setdefault("DATABASE_OPTIONS", '{"TrustServerCertificate": "yes"}')
 
     # Stop app.py's import-time create_all. Without a database it would try
     # to connect; with one, the tables come from tests/seed.py instead
