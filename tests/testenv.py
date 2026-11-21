@@ -19,6 +19,8 @@ TEST_ENV = {
     "INTERNAL_JOB_SECRET": "test-job-secret",
     "admin_secret": "test-admin-secret",
     "BASE_URL": "https://testserver",
+    "AZURE_EMAIL_CONNECTION_STRING": "endpoint=https://fake.invalid/;accesskey=ZmFrZQ==",
+    "AZURE_EMAIL_SENDER": "DoNotReply@test.invalid",
 }
 
 _configured = False
