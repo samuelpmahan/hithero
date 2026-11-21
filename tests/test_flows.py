@@ -67,19 +67,17 @@ def test_register_validate_create_profile(fresh_db):
     # Log in and create the teacher profile.
     dana = helpers.client()
     r = login(dana, new["email"], new["password"])
-    assert r.json() == {"message": "Login successful as teacher", "createCount": None, "role": "teacher"}
-    # createCount is NULL for validated users: move_user doesn't set it, and
-    # create_teacher_profile only allows createCount == 0 for teachers.
+    assert r.json() == {"message": "Login successful as teacher", "createCount": 0, "role": "teacher"}
     r = dana.post("/profile/create_teacher_profile/", data={
         "name": "Dana Diaz", "state": "Illinois", "county": "Sangamon",
         "district": "Springfield District", "school": "Douglas Middle",
         "aboutMe": "Music teacher.", "wishlist": "https://www.amazon.com/hz/wishlist/ls/DANA",
     })
-    assert r.json() == {"message": "Unable to create new profile. Profile already created."}
+    assert r.json() == {"message": "Teacher created successfully", "role": "teacher"}
 
 
 def test_create_profile_and_open_teacher_page(fresh_db):
-    """The profile half of the journey, for a user whose createCount is 0."""
+    """Create a profile, then open it as a visitor."""
     import app
 
     db = app.SessionLocal()

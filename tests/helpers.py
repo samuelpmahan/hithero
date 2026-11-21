@@ -89,9 +89,6 @@ def outbox(monkeypatch) -> FakeEmailClient:
     return fake
 
 
-db_dirty = False
-
-
 def reseed() -> None:
     import app as app_module
     from tests import seed
@@ -104,7 +101,7 @@ def reseed() -> None:
 
 @pytest.fixture
 def fresh_db(outbox):
-    """Reseed the test database before a test that writes to it.
+    """Reseed the test database around a test that writes to it.
 
     Also switches off rate limits (login, register, posting and commenting
     allow 5 a minute) and fakes email and reCAPTCHA through `outbox`.
@@ -113,10 +110,9 @@ def fresh_db(outbox):
     import app as app_module
 
     reseed()
-    global db_dirty
-    db_dirty = True
     app_module.limiter.enabled = False
     try:
         yield outbox
     finally:
         app_module.limiter.enabled = True
+        reseed()  # leave the seeded data for the read-only tests
