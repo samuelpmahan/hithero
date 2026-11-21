@@ -8,102 +8,71 @@ from sqlalchemy.orm import Session
 from auth.dependencies import CurrentUser, require_admin, require_member
 from auth.session import get_index_cookie, store_my_cookies
 from db import get_db
-from emails import send_validation_email
-from repositories import teachers, users
+from services import validation
 
 logger = logging.getLogger("app")
 router = APIRouter()
 
 
-# Endpoint to move a user from new_users to registered_users and delete item in new_users
+def _server_error(e: Exception) -> HTTPException:
+    logger.error(f"Internal Server Error: {str(e)}")
+    return HTTPException(status_code=500, detail="Internal Server Error")
+
+
 @router.post("/validation/validate_user/{user_email}")
 async def move_user(user_email: str, caller: CurrentUser = Depends(require_member), db: Session = Depends(get_db)):
     try:
-        pending = users.get_pending(db, user_email)
-        if not pending:
-            raise HTTPException(status_code=404, detail="User not found in new_users")
-
-        # Teachers can only validate users within their own district
-        if caller.role == 'teacher':
-            teacher_record = teachers.get_by_user_id(db, caller.id)
-            if not teacher_record or (
-                pending.state != teacher_record.state or
-                pending.county != teacher_record.county or
-                pending.district != teacher_record.district
-            ):
-                raise HTTPException(status_code=403, detail="You can only validate teachers in your own district.")
-
-        email = pending.email
-        users.promote_pending(db, pending)
-        db.commit()
-        send_validation_email(email)
-        return {"message": "User validated."}
+        validation.validate(db, caller, user_email)
     except HTTPException:
         raise
     except Exception as e:
         db.rollback()
-        logger.error(f"Internal Server Error: {str(e)}") 
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+        raise _server_error(e)
+    return {"message": "User validated."}
 
 
-def _pending_dict(u) -> dict:
-    return {"name": u.name, "email": u.email, "state": u.state, "district": u.district, "school": u.school,
-            "phone_number": u.phone_number, "report": u.report, "emailed": u.emailed}
-
-
-#gets a list of unverified users to validate based on the role of the user
 @router.get("/api/validation_list/")
 async def validation_page(request: Request, caller: CurrentUser = Depends(require_member), db: Session = Depends(get_db)):
-    role, id = caller.role, caller.id
     try:
-        if role == "admin":
-            new_users = users.list_pending(db)
-            return {"new_users": [_pending_dict(u) for u in new_users], "role": role}
-        if role == 'teacher':
-            store_my_cookies(request, id, db)
-            state = get_index_cookie('state', request)
-            county = get_index_cookie('county', request)
-            district = get_index_cookie('district', request)
-            new_users = users.list_pending_in_district(db, state, county, district)
-            return {"new_users": [_pending_dict(u) for u in new_users], "role": role}
+        if caller.role == "teacher":
+            # Also refreshes the teacher's location in the session (500 if they have no page).
+            store_my_cookies(request, caller.id, db)
+        new_users = validation.pending_for(
+            db, caller.role, get_index_cookie("state", request), get_index_cookie("county", request),
+            get_index_cookie("district", request))
     except Exception as e:
-        logger.error(f"Internal Server Error: {str(e)}") 
-        raise HTTPException(status_code=500, detail="Internal Server Error")          
+        raise _server_error(e)
+    if new_users is None:
+        return None
+    return {"new_users": new_users, "role": caller.role}
 
-# Endpoint to  users
+
 @router.post("/validation/delete_user/{user_email}")
 async def delete_user(user_email: str, caller: CurrentUser = Depends(require_admin), db: Session = Depends(get_db)):
     try:
-        if not users.email_pending(db, user_email):
-            raise HTTPException(status_code=404, detail="User not found in new_users")
-        users.delete_pending(db, user_email)
-        db.commit()
-        return {"message": "User deleted successfully."}
+        validation.delete(db, user_email)
     except Exception as e:
+        # Existing behaviour: an unknown email also lands here and answers 500.
         db.rollback()
-        logger.error(f"Internal Server Error: {str(e)}") 
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+        raise _server_error(e)
+    return {"message": "User deleted successfully."}
 
-# Function to report a user in validation
+
 @router.post("/validation/report_user/{user_email}")
 async def report_user(user_email: str, user: CurrentUser = Depends(require_member), db: Session = Depends(get_db)):
     try:
-        users.flag_pending(db, user_email, report=1)
-        db.commit()
-        return {"message": "User reported."}
+        validation.flag(db, user_email, report=1)
     except Exception as e:
         db.rollback()
-        logger.error(f"Internal Server Error: {str(e)}") 
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+        raise _server_error(e)
+    return {"message": "User reported."}
 
-# Endpoint to mark that a new users has been emailed
+
 @router.post("/validation/emailed_user/{user_email}")
 async def emailed_user(user_email: str, user: CurrentUser = Depends(require_member), db: Session = Depends(get_db)):
     try:
-        users.flag_pending(db, user_email, emailed=1)
-        db.commit()
-        return {"message": "User emailed."}
+        validation.flag(db, user_email, emailed=1)
     except Exception as e:
         db.rollback()
-        logger.error(f"Internal Server Error: {str(e)}") 
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+        raise _server_error(e)
+    return {"message": "User emailed."}

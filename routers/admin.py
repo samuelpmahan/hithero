@@ -12,11 +12,10 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 from sqlalchemy.orm import Session
 
 from auth.dependencies import CurrentUser, require_admin
-from auth.passwords import hash_password
-from config import settings
 from db import get_db
 from ratelimit import limiter
 from repositories import teachers, users
+from services import accounts
 
 logger = logging.getLogger("app")
 router = APIRouter()
@@ -91,34 +90,16 @@ async def admin_delete_user_account(target_email: str = Form(...), admin_secret_
     by providing the target user's email and a secret key via form submission.
     Deletes the associated teacher entry and the registered user account.
     """
-    
-    # 2. SECRET CHECK: Ensure the provided secret matches the server configuration
-    ADMIN_SECRET = settings.admin_secret
-    
-    if not ADMIN_SECRET or admin_secret_input != ADMIN_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid administrator secret provided.")
-
+    accounts.check_admin_secret(admin_secret_input)
     try:
-        # 3. FIND THE TARGET USER ID
-        # Select the ID of the user to be deleted based on the target email.
-        target = users.get_by_email(db, target_email)
-
-        if not target:
-            raise HTTPException(status_code=404, detail=f"User account linked to '{target_email}' not found.")
-
-        # 4. Delete their teacher page, then the account itself.
-        teachers.delete_for_user(db, target.id)
-        users.delete_by_email(db, target_email)
-        db.commit()
-        return {"message": f"Successfully deleted account and associated data for target user: {target_email}."}
-
-    except HTTPException as h:
-        raise h
+        accounts.delete_account(db, target_email)
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
-        print(f"Error during administrative account deletion for {target_email}: {str(e)}")
-        logger.error(f"Internal Server Error: {str(e)}") 
-        raise HTTPException(status_code=500, detail=f"Internal Server Error")
+        logger.error(f"Internal Server Error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+    return {"message": f"Successfully deleted account and associated data for target user: {target_email}."}
 
 
 @router.post("/admin/create_admin/")
@@ -136,32 +117,14 @@ async def create_admin_account(
     secret, to create a brand new admin account directly in registered_users.
     Only email, password, and role are stored; id is auto-assigned by the DB.
     """
-
-    # 2. SECRET CHECK: Same server secret used for other sensitive admin actions
-    ADMIN_SECRET = settings.admin_secret
-    if not ADMIN_SECRET or admin_secret_input != ADMIN_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid administrator secret provided.")
-
-    # 3. BASIC VALIDATION
-    if password != confirm_password:
-        raise HTTPException(status_code=400, detail="Passwords do not match.")
-    if len(password) < 8:
-        raise HTTPException(status_code=400, detail="Password must be at least 8 characters long.")
-
+    accounts.check_admin_secret(admin_secret_input)
+    accounts.check_new_admin_password(password, confirm_password)
     try:
-        # 4. Make sure this email isn't already in use, in either table
-        if users.email_registered(db, email) or users.email_pending(db, email):
-            raise HTTPException(status_code=400, detail="An account with this email already exists.")
-
-        # 5. Create the admin account directly in registered_users (id auto-assigned by the DB)
-        hashed_password = hash_password(password)
-        users.create_admin(db, email, hashed_password)
-        db.commit()
-        return {"message": f"Admin account created successfully for {email}."}
-
+        accounts.create_admin(db, email, password)
     except HTTPException:
         raise
     except Exception as e:
         db.rollback()
         logger.error(f"Error creating admin account: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
+    return {"message": f"Admin account created successfully for {email}."}
