@@ -16,9 +16,14 @@ Schema note: app.py's models cannot build an empty database as they
 stand. password_reset_tokens.token is String with no length (VARCHAR(max))
 and unique=True, and SQL Server cannot index VARCHAR(max) (error 1919).
 So production's tables were not made by this create_all, and their real
-column types are unknown until the BE2-1 audit. Here the token column is
-given a length before the tables are built. Everything else matches the
-models.
+column types are unknown until the BE2-1 audit. Two adjustments are made
+here before the tables are built:
+  - the token column gets a length;
+  - registered_users.createCount gets DEFAULT 0. The validate route
+    inserts users without a createCount, and only createCount == 0 may
+    create a profile, so the live site working means production must
+    have this default. The audit should confirm it.
+Everything else matches the models.
 """
 import datetime
 import os
@@ -76,6 +81,7 @@ def seed() -> None:
     )
 
     app_module.PasswordResetToken.__table__.c.token.type = sqlalchemy.String(255)
+    app_module.RegisteredUsers.__table__.c.createCount.server_default = sqlalchemy.DefaultClause("0")
     app_module.engine.dispose()  # drop connections to the old database
     testenv.real_create_all(app_module.Base.metadata, bind=app_module.engine)
 
