@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Request, Form, Depends, Body, File, 
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 import os, logging, smtplib, secrets, string, pyodbc, time, ssl, datetime, base64, requests, threading
-from dotenv import load_dotenv
+from config import settings
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.applications import Starlette
@@ -26,17 +26,16 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 
 app = FastAPI()
-load_dotenv()
 logger = logging.getLogger(__name__)
-app.add_middleware(SessionMiddleware, secret_key=os.getenv("SECRET_KEY"), https_only=True)
+app.add_middleware(SessionMiddleware, secret_key=settings.secret_key, https_only=True)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://www.helpteachers.net", "https://helpteachers.net"],
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["*"],
 )
-RECAPTCHA_SECRET_KEY=os.getenv("SERVER_KEY_CAPTCHA")
+RECAPTCHA_SECRET_KEY = settings.server_key_captcha
 
 ##limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -72,12 +71,7 @@ async def get_sitemap_xml():
     return FileResponse(SITEMAP_XML_PATH, media_type='application/xml')
 
 # --- Configuration for Promotional Images Mapping ---
-PROMO_IMAGE_MAPPING = {
-    "seattlewolf": "images/partners/1007TheWolf.png",
-    "livefree": "images/partners/965CountryColor.png",
-    "basecamp": "images/partners/BaseCamp.png",
-    "coastal": "images/partners/Coastal.png"
-}
+PROMO_IMAGE_MAPPING = settings.promo_images
 
 ###cronjob ip white list
 CRONJOB_ALLOWED_IPS = {
@@ -89,15 +83,8 @@ CRONJOB_ALLOWED_IPS = {
 }
 
 
-# Load environment variables
-DATABASE_SERVER = os.getenv("DATABASE_SERVER")
-DATABASE_NAME = os.getenv("DATABASE_NAME")
-DATABASE_UID = os.getenv("DATABASE_UID")
-DATABASE_PASSWORD = os.getenv("DATABASE_PASSWORD")
-DATABASE_PORT = os.getenv("DATABASE_PORT")
-
 # Construct SQLAlchemy database URL
-SQLALCHEMY_DATABASE_URL = f"mssql+pyodbc://{DATABASE_UID}:{DATABASE_PASSWORD}@{DATABASE_SERVER}:{DATABASE_PORT}/{DATABASE_NAME}?driver=ODBC+Driver+18+for+SQL+Server"
+SQLALCHEMY_DATABASE_URL = f"mssql+pyodbc://{settings.database_uid}:{settings.database_password}@{settings.database_server}:{settings.database_port}/{settings.database_name}?driver=ODBC+Driver+18+for+SQL+Server"
 engine = create_engine(SQLALCHEMY_DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -296,8 +283,8 @@ def send_email(recipient_email: str, subject: str, html_message: str, plain_mess
     Sends an email using Azure Communication Services Email.
     """
     try:
-        connection_string = os.getenv("AZURE_EMAIL_CONNECTION_STRING")
-        sender_address = os.getenv("AZURE_EMAIL_SENDER")
+        connection_string = settings.azure_email_connection_string
+        sender_address = settings.azure_email_sender
 
         client = EmailClient.from_connection_string(connection_string)
 
@@ -444,7 +431,7 @@ def send_teacher_of_the_day_email(recipient_email: str, recipient_name: str, url
             "Congratulations! You've been chosen as today's 'Teacher of the Day' at Homeroom Heroes! "
             "Your profile is now featured on our homepage, giving you extra visibility. "
             "Remember to share your unique page with your community. "
-            f"www.HelpTeachers.net/teacher/{url_id}"
+            f"{settings.display_host}/teacher/{url_id}"
         )
     }
 
@@ -602,7 +589,7 @@ def wednesday_job():
 ######   EMAILER FUNCTIONS FOR CRONJOBS  ###########
 def verify_cronjob_request(request: Request):
     secret = request.headers.get("x-secret-key")
-    if not secret or secret != os.getenv("INTERNAL_JOB_SECRET"):
+    if not secret or secret != settings.internal_job_secret:
         raise HTTPException(status_code=403, detail="Forbidden")
 
 @app.post("/internal/run-wednesday-job")
@@ -672,7 +659,7 @@ def send_profile_reminder_email(recipient_email: str):
             "You're almost there! Your registration with us has been "
             "successfully validated, but you haven't created your profile yet. "
             "Please log in and complete your profile to start receiving support from our community.\n"
-            "www.HelpTeachers.net/pages/login.html"
+            f"{settings.display_host}/pages/login.html"
         )
     }
 
@@ -1422,7 +1409,7 @@ async def forgot_password(request: Request, email: str = Form(...)):
             db.add(reset_token)
             db.commit()
             # Send email with link instead of temp password
-            reset_link = f"https://www.helpteachers.net/pages/reset_password.html?token={token}"
+            reset_link = f"{settings.base_url}/pages/reset_password.html?token={token}"
             template_data = {
                 'recipient_name': email,
                 'message_body': (
@@ -1544,7 +1531,7 @@ async def get_teacher_url(request: Request):
         token = result.fetchone()
         if not token:
             raise HTTPException(status_code=404, detail="No matching teacher found")
-        url = "www.HelpTeachers.net/teacher/" + token[0]
+        url = f"{settings.display_host}/teacher/" + token[0]
         return {"url": url}  # Return as JSON
     except Exception as e:
         logger.error(f"Internal Server Error: {str(e)}") 
@@ -2251,8 +2238,7 @@ async def admin_delete_user_account(target_email: str = Form(...), admin_secret_
         raise HTTPException(status_code=403, detail="Forbidden. Only administrators can delete user accounts.")
 
     # 2. SECRET CHECK: Ensure the provided secret matches the server configuration
-    # The user-provided prompt suggests checking os.getenv("DATABASE_SERVER")
-    ADMIN_SECRET = os.getenv("admin_secret")
+    ADMIN_SECRET = settings.admin_secret
     
     if not ADMIN_SECRET or admin_secret_input != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Invalid administrator secret provided.")
@@ -2317,7 +2303,7 @@ async def create_admin_account(
         raise HTTPException(status_code=403, detail="Forbidden. Only administrators can create admin accounts.")
 
     # 2. SECRET CHECK: Same server secret used for other sensitive admin actions
-    ADMIN_SECRET = os.getenv("admin_secret")
+    ADMIN_SECRET = settings.admin_secret
     if not ADMIN_SECRET or admin_secret_input != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Invalid administrator secret provided.")
 

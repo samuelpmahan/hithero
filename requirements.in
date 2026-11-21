@@ -22,3 +22,4 @@ slowapi
 bleach
 puremagic
 reportlab
+pydantic-settings
