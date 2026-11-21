@@ -73,8 +73,8 @@ def test_teacher_can_edit_only_their_own_page(page, issues, site_url):
     page.goto(site_url + "/teacher/bob5678", wait_until="networkidle")
     page.wait_for_function("document.querySelector('#teacher-name').innerText.includes('Bob')")
     assert "hidden" in page.get_attribute("#editButton", "class")
-    # Bob's page: check_access_teacher refuses. It means 403 but answers 500.
-    known = KNOWN + ["HTTP 500: GET /api/check_access_teacher/"]
+    # Bob's page: check_access_teacher refuses with 403, which is expected.
+    known = KNOWN + ["HTTP 403: GET /api/check_access_teacher/"]
     assert issues.unexpected(known) == []
 
 

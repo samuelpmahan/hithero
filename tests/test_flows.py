@@ -6,16 +6,15 @@ through the HTTP API, each on a freshly seeded database:
   - forgot password > reset > log in with the new password
   - forum post > comment > vote > edit > delete
 
-They assert today's behaviour, including responses that look wrong
-(noted inline), so the refactor can't change them silently. When a
-later task fixes one of those on purpose, update the assertion with it.
+They assert today's behaviour, so the refactor can't change it silently.
+When a task changes behaviour on purpose, the assertion changes with it.
 """
 import re
 
 import pytest
 
 from tests import helpers
-from tests.helpers import fresh_db, outbox, requires_db  # noqa: F401  (fixtures)
+from tests.helpers import fresh_db, no_rate_limits, outbox, requires_db  # noqa: F401  (fixtures)
 from tests.seed import SEED_PASSWORD
 
 pytestmark = requires_db
@@ -166,8 +165,11 @@ def test_forum_post_comment_vote_edit_delete(fresh_db):
     login(bob, "bob@example.com")
     login(admin, "admin@example.com")
 
-    # Logged out can't post.
-    assert helpers.client().post("/forum/create_post", data={"title": "x", "content": "y"}).status_code == 401
+    # Logged out can't post, comment or vote.
+    anon = helpers.client()
+    assert anon.post("/forum/create_post", data={"title": "x", "content": "y"}).status_code == 401
+    assert anon.post("/forum/posts/1/comment", data={"content": "x"}).status_code == 401
+    assert anon.post("/forum/posts/1/vote", json={"vote_type": 1}).status_code == 401
 
     r = alice.post("/forum/create_post", data={
         "title": "Field trip <script>x</script>ideas", "content": "<p>Where do you <b>go</b>?</p>"})
@@ -194,16 +196,15 @@ def test_forum_post_comment_vote_edit_delete(fresh_db):
     assert bob.post(f"/forum/posts/{post_id}/vote", json={"vote_type": 1}).json()["upvote_count"] == 2
     assert bob.post(f"/forum/posts/{post_id}/vote", json={"vote_type": 5}).status_code == 400
 
-    # Edit: only the author. Others get 500, not 403, because the 403 is
-    # raised inside a broad except (see BE3-1).
+    # Edit: only the author.
     r = bob.patch(f"/forum/post/{post_id}/update", json={"title": "Hacked", "content": "x"})
-    assert r.status_code == 500
+    assert r.status_code == 403
     r = alice.patch(f"/forum/post/{post_id}/update", json={"title": "Field trips", "content": "<p>Updated</p>"})
     assert r.status_code == 200
     assert (r.json()["title"], r.json()["content"]) == ("Field trips", "<p>Updated</p>")
 
     r = alice.patch(f"/forum/comment/{comment_id}/update", data={"content": "Not mine"})
-    assert r.status_code == 500
+    assert r.status_code == 403
     r = bob.patch(f"/forum/comment/{comment_id}/update", data={"content": "The art museum."})
     assert r.json()["content"] == "The art museum."
 
@@ -245,3 +246,38 @@ def test_daily_teacher_of_the_day_job(fresh_db):
 
     featured = helpers.client().get("/api/teacher_of_the_day").json()
     assert featured["url_id"] in message["content"]["plainText"]
+
+
+DENIED = [
+    # (who, method, path, form data or JSON) -> expect 403
+    (None, "post", "/validation/validate_user/pending@example.com", None),
+    (None, "post", "/validation/report_user/pending@example.com", None),
+    (None, "post", "/validation/emailed_user/pending@example.com", None),
+    ("alice@example.com", "post", "/validation/delete_user/pending@example.com", None),
+    (None, "post", "/profile/update_info/", {"aboutMe": "x"}),
+    (None, "post", "/profile/update_teacher_name/", {"teacher": "x"}),
+    (None, "post", "/profile/update_wishlist/", {"wishlist": "x"}),
+    (None, "post", "/profile/update_url_id/", {"url_id": "xyz123"}),
+    (None, "post", "/profile/update_teacher_school/",
+     {"state": "x", "county": "x", "district": "x", "school": "x"}),
+    (None, "post", "/profile/create_teacher_profile/",
+     {"name": "x", "state": "x", "county": "x", "district": "x", "school": "x", "aboutMe": "x", "wishlist": "x"}),
+    ("alice@example.com", "post", "/admin/generate_teacher_report/", {"state": "Illinois"}),
+    ("alice@example.com", "post", "/profile/delete/", {"target_email": "bob@example.com", "admin_secret_input": "x"}),
+    ("alice@example.com", "post", "/admin/create_admin/",
+     {"email": "x@example.com", "password": "x", "confirm_password": "x", "admin_secret_input": "x"}),
+    ("alice@example.com", "delete", "/forum/post/1/delete", None),
+    ("alice@example.com", "delete", "/forum/comment/1/delete", None),
+    (None, "get", "/api/validation_list/", None),
+    ("admin@example.com", "get", "/api/check_access_teacher/", None),
+]
+
+
+@pytest.mark.parametrize("who,method,path,data", DENIED, ids=[f"{d[0] or 'anon'} {d[2]}" for d in DENIED])
+def test_denied_calls_return_403(no_rate_limits, who, method, path, data):
+    """BE3-1: every refused call answers 403, not 200 or 500."""
+    c = helpers.client()
+    if who:
+        login(c, who)
+    r = getattr(c, method)(path, data=data) if data else getattr(c, method)(path)
+    assert r.status_code == 403, f"{path} answered {r.status_code}"

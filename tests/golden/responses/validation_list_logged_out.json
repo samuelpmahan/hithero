@@ -1,9 +1,7 @@
 {
-  "body": {
-    "detail": "Internal Server Error"
-  },
-  "content_type": "application/json",
+  "body": "sha256:ab601e6d13500d29cb7d42d2eb2576ecc2be2dc30f7c7b4e7297976994c46cd9",
+  "content_type": "text/html; charset=utf-8",
   "location": null,
   "session": {},
-  "status": 500
+  "status": 403
 }
